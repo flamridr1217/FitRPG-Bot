@@ -1,20 +1,23 @@
-// FitRPG Bot — FINAL • Mongo + Keep-Alive Edition
+// FitRPG Bot — FINAL • Mongo + Keep-Alive + Mobile UX Edition
 // - Cloud persistence (MongoDB Atlas) — no Render Disk needed
 // - Keep-alive pinger (prevents Render free from sleeping)
 // - Reconnect hooks for Discord + Mongo
-// - XP model (slightly buffed) + softened curve (~16–18 months -> L500 with steady work)
+// - Rotating presence tips (mobile onboarding)
+// - XP model (slightly buffed) + softened curve (targets ~16–18 mo -> L500 with steady work)
 // - Role ladder to 1000 (Novice -> Transcendent)
 // - Tokens from logs -> Adventures (loot-first; trinkets rare)
 // - Expanded Shop (paged), Inventory, Gear, Consumables (+ /use)
-// - Daily Challenges (auto 00:01 America/Chicago), /daily show/claim
+// - Daily Challenges (auto 00:01 America/Chicago), /daily show/claim and auto-pin
 // - Simple Raids
-// - Mobile-first shortcuts: /p /plank /runmiles + /quicklog
-// - QoL: /help /ping
-// - Reliability: rate limit, error guards, daily de-dupe, atomic saves
+// - Mobile-first shortcuts: /p /plank /runmiles + /quicklog + /logmenu (buttons + modal)
+// - QoL: /help /ping /leaderboard
+// - Reliability: rate limit, error guards, daily de-dupe, atomic saves, graceful shutdown
 
 const {
   Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder,
-  EmbedBuilder, PermissionFlagsBits, ActionRowBuilder, StringSelectMenuBuilder
+  EmbedBuilder, PermissionFlagsBits, ActionRowBuilder,
+  ButtonBuilder, ButtonStyle, StringSelectMenuBuilder,
+  ModalBuilder, TextInputBuilder, TextInputStyle
 } = require('discord.js');
 const fs = require('fs');
 const http = require('http');
@@ -161,6 +164,30 @@ function norm(s){ return String(s||'').trim().toLowerCase().replace(/\s+/g,'_');
 function R(min,max){ return Math.floor(Math.random()*(max-min+1))+min; }
 function todayISO(){ return new Date().toISOString().slice(0,10); }
 function getNowInTZ(tz) { return new Date(new Date().toLocaleString('en-US', { timeZone: tz })); }
+function clamp(n, lo=0, hi=1){ return Math.max(lo, Math.min(hi, n)); }
+function bar(p, len=16){
+  const filled = Math.round(clamp(p,0,1)*len);
+  return '▰'.repeat(filled) + '▱'.repeat(len - filled);
+}
+
+/* ---------------- Rotating Presence (mobile onboarding) ---------------- */
+const presenceTips = [
+  'Type /logmenu on mobile',
+  'Loot runs: /adventure',
+  'Shop: /shop • /buy',
+  'Daily @ 00:01 CT',
+  'Profile: /profile',
+];
+function startPresenceRotation() {
+  let i = 0;
+  setInterval(() => {
+    client.user?.setPresence({
+      activities: [{ name: presenceTips[i % presenceTips.length] }],
+      status: 'online'
+    });
+    i++;
+  }, 60 * 1000); // rotate every minute
+}
 
 /* ---------------- Users ---------------- */
 function ensureUser(id){
@@ -385,17 +412,20 @@ function dailyPreviewEmbed(){
     .setTitle(`📅 Daily Challenge — ${d.date} • Theme: ${d.theme.toUpperCase()}`)
     .setColor(0xFFD700)
     .setDescription(lines.join('\n'))
-    .setFooter({ text:'Log normally (/p, /plank, /runmiles). Use /daily claim when done.' });
+    .setFooter({ text:'Log normally (/p, /plank, /runmiles, /logmenu). Use /daily claim when done.' });
 }
 
-/* ---------------- Daily Auto-Post Scheduler (00:01 CT) ---------------- */
+/* ---------------- Daily Auto-Post Scheduler (00:01 CT) + Pin ---------------- */
 function dailyKey(dateISO, hour, minute){ return `${dateISO}_${hour}:${minute}`; }
 async function postDailyChallenge(){
   const d = ensureTodayDaily();
   if(store.config.dailyChannelId){
     try{
       const ch = await client.channels.fetch(store.config.dailyChannelId);
-      if (ch) await ch.send({ embeds:[dailyPreviewEmbed()] });
+      if (ch) {
+        const sent = await ch.send({ embeds:[dailyPreviewEmbed()] });
+        try { await sent.pin(); } catch {}
+      }
     }catch(e){ console.error('DAILY_POST_ERROR', e); }
   }
   try { await saveAll(); backup(); } catch(e){ console.error('POST_SAVE_BACKUP_ERR', e); }
@@ -434,6 +464,7 @@ const commands = [
     .addNumberOption(o=>o.setName('amount').setDescription('Reps/seconds/miles').setRequired(true)),
 
   new SlashCommandBuilder().setName('quicklog').setDescription('Menu for common logs'),
+  new SlashCommandBuilder().setName('logmenu').setDescription('Mobile logging: buttons & modal'),
 
   new SlashCommandBuilder().setName('adventure').setDescription('Spend a token to adventure'),
 
@@ -458,6 +489,7 @@ const commands = [
     .addSubcommand(s=>s.setName('status').setDescription('Show raid status')),
 
   new SlashCommandBuilder().setName('profile').setDescription('View your profile'),
+  new SlashCommandBuilder().setName('leaderboard').setDescription('Top 10 by XP'),
 
   new SlashCommandBuilder().setName('setdailychannel').setDescription('Set daily challenge channel')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
@@ -493,17 +525,18 @@ client.on('interactionCreate', async interaction => {
           .setTitle('📖 FitRPG Help')
           .setColor(0x00c2ff)
           .setDescription([
-            '• **Log**: `/p`, `/plank`, `/runmiles`, or `/log type:<pushups|plank|run_miles> amount:<n>`',
-            '• **Quick (mobile)**: `/quicklog`',
+            '• **Log**: `/p`, `/plank`, `/runmiles`, `/log type:<pushups|plank|run_miles> amount:<n>`',
+            '• **Mobile**: `/logmenu` (buttons & modal) or `/quicklog` (select menu)',
             '• **Adventure (loot)**: `/adventure` — costs 1 token (from workouts)',
             '• **Daily**: auto 12:01 AM CT → `/daily show` • `/daily claim`',
-            '• **Shop/Gear**: `/shop`, `/buy item:<name>`, `/inventory`, `/equip item:<name>`, `/use item:<consumable>`, `/gear`',
+            '• **Shop/Gear**: `/shop`, `/buy item:<name>`, `/inventory`, `/equip item:<name>`, `/use item:<consumable>`',
             '• **Raids**: `/raid start`, `/raid join`, `/raid attack`, `/raid status`',
+            '• **Leaderboard**: `/leaderboard`',
             '• **Profile**: `/profile`',
             '',
             'Admins: `/setdailychannel`, `/setlevelupchannel`, `/setdailytime hour minute`'
           ].join('\n'))
-          .setFooter({ text: 'Tip: use the shortcuts on your phone to avoid typing.' });
+          .setFooter({ text: 'Tip: use the shortcuts on your phone — no typing needed.' });
         return interaction.reply({ embeds:[emb], ephemeral:true });
       }
 
@@ -528,6 +561,7 @@ client.on('interactionCreate', async interaction => {
         return doWorkoutLog(interaction, user, type, amt, def.rate*amt, def.unit||'');
       }
 
+      /* Quick menus */
       case 'quicklog': {
         const menu = new StringSelectMenuBuilder()
           .setCustomId('ql')
@@ -540,6 +574,22 @@ client.on('interactionCreate', async interaction => {
           ]);
         const row = new ActionRowBuilder().addComponents(menu);
         return interaction.reply({ content:'QuickLog:', components:[row], ephemeral:true });
+      }
+      case 'logmenu': {
+        const row1 = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('p:25').setLabel('Pushups +25').setStyle(ButtonStyle.Primary),
+          new ButtonBuilder().setCustomId('p:50').setLabel('Pushups +50').setStyle(ButtonStyle.Primary),
+          new ButtonBuilder().setCustomId('p:100').setLabel('Pushups +100').setStyle(ButtonStyle.Primary),
+        );
+        const row2 = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('plank:60').setLabel('Plank 60s').setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId('plank:120').setLabel('Plank 120s').setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId('runmiles:2').setLabel('Run 2 mi').setStyle(ButtonStyle.Secondary),
+        );
+        const row3 = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('custom').setLabel('Custom…').setStyle(ButtonStyle.Success)
+        );
+        return interaction.reply({ content:'Tap to log quickly:', components:[row1,row2,row3], ephemeral:true });
       }
 
       /* Adventures */
@@ -660,10 +710,28 @@ client.on('interactionCreate', async interaction => {
         break;
       }
 
-      /* Profile */
+      /* Profile & Leaderboard */
       case 'profile': {
         const lvl=levelFromXp(user.xp);
         return interaction.reply(`👤 ${interaction.user.username}\nLvl ${lvl} (${user.xp} XP)\nCoins: ${user.coins}\nTokens: ${user.tokens}\n\nNeed commands? Type **/help**.`);
+      }
+      case 'leaderboard': {
+        let top = [];
+        if (colUsers) {
+          const docs = await colUsers.aggregate([
+            { $project: { _id:1, xp:'$data.xp' } },
+            { $sort: { xp: -1 } },
+            { $limit: 10 }
+          ]).toArray();
+          top = docs.map((d,i)=>`**${i+1}.** <@${d._id}> — ${d.xp||0} XP`);
+        } else {
+          const arr = Object.entries(store.users).map(([id,u])=>({id, xp:u.xp||0}));
+          arr.sort((a,b)=>b.xp-a.xp);
+          top = arr.slice(0,10).map((d,i)=>`**${i+1}.** <@${d.id}> — ${d.xp} XP`);
+        }
+        if (!top.length) return interaction.reply('No data yet. Log a workout!');
+        const emb = new EmbedBuilder().setTitle('🏆 Leaderboard — Top 10 (XP)').setColor(0x00c2ff).setDescription(top.join('\n'));
+        return interaction.reply({ embeds:[emb] });
       }
 
       /* Admin config */
@@ -692,7 +760,7 @@ client.on('interactionCreate', async interaction => {
   }
 });
 
-/* QuickLog menu handler */
+/* QuickLog select menu handler */
 client.on('interactionCreate', async i=>{
   if(!i.isStringSelectMenu()) return;
   if(i.customId==='ql'){
@@ -703,6 +771,42 @@ client.on('interactionCreate', async i=>{
     if(cmd==='p'){ return doWorkoutLog({reply:update}, user, 'pushups', parseInt(val), BUILT_INS.pushups.rate*parseInt(val), 'reps', true); }
     if(cmd==='plank'){ return doWorkoutLog({reply:update}, user, 'plank', parseInt(val), BUILT_INS.plank.rate*parseInt(val), 'seconds', true); }
     if(cmd==='runmiles'){ return doWorkoutLog({reply:update}, user, 'run_miles', parseFloat(val), BUILT_INS.run_miles.rate*parseFloat(val), 'miles', true); }
+  }
+});
+
+/* Buttons + Modal for /logmenu */
+client.on('interactionCreate', async i=>{
+  if (i.isButton()) {
+    await mongoHydrateUser(i.user.id);
+    const user = ensureUser(i.user.id);
+
+    if (i.customId === 'custom') {
+      const modal = new ModalBuilder().setCustomId('customLog').setTitle('Custom Log');
+      const tType = new TextInputBuilder().setCustomId('type').setLabel('Type (pushups|plank|run_miles)').setStyle(TextInputStyle.Short).setRequired(true);
+      const tAmt  = new TextInputBuilder().setCustomId('amount').setLabel('Amount (reps|seconds|miles)').setStyle(TextInputStyle.Short).setRequired(true);
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(tType),
+        new ActionRowBuilder().addComponents(tAmt)
+      );
+      return i.showModal(modal);
+    }
+
+    const [cmd, val] = i.customId.split(':');
+    if (cmd==='p')        return doWorkoutLog(i, user, 'pushups',  parseInt(val), BUILT_INS.pushups.rate*parseInt(val), 'reps', true);
+    if (cmd==='plank')    return doWorkoutLog(i, user, 'plank',   parseInt(val), BUILT_INS.plank.rate*parseInt(val), 'seconds', true);
+    if (cmd==='runmiles') return doWorkoutLog(i, user, 'run_miles', parseFloat(val), BUILT_INS.run_miles.rate*parseFloat(val), 'miles', true);
+  }
+
+  if (i.isModalSubmit() && i.customId==='customLog') {
+    await mongoHydrateUser(i.user.id);
+    const user = ensureUser(i.user.id);
+    const type = (i.fields.getTextInputValue('type')||'').trim().toLowerCase();
+    const amt  = parseFloat(i.fields.getTextInputValue('amount'));
+    const def  = BUILT_INS[type];
+    if(!def || !Number.isFinite(amt) || amt<=0) {
+      return i.reply({ content:'⚠️ Invalid type or amount.', ephemeral:true });
+    }
+    return doWorkoutLog(i, user, type, amt, def.rate*amt, def.unit||'', true);
   }
 });
 
@@ -763,44 +867,51 @@ async function onLevelUp(interaction, userObj, userData, oldLvl, newLvl){
       for (const m of milestones) {
         if (oldLvl < m.level && newLvl >= m.level) {
           const role = guild.roles.cache.find(r=>r.name===m.roleName);
-          if (role) {
-            await member.roles.add(role).catch(()=>{});
-            granted.push(m.roleName);
-          }
+          if (role) { await member.roles.add(role).catch(()=>{}); granted.push(m.roleName); }
         }
       }
     }
   }
 
+  // compute progress toward next level
+  const reqNext = xpToNextLevel(newLvl);
+  let spent=0; for (let k=0;k<newLvl;k++) spent += xpToNextLevel(k);
+  const into = userData.xp - spent;
+  const pct = reqNext>0 ? into/reqNext : 1;
+
+  // Level-up embed
+  const levelEmb = new EmbedBuilder()
+    .setTitle('🎆 **LEVEL UP!** 🎆')
+    .setColor(0x7CFC00)
+    .setDescription([
+      `<@${userObj.id}> reached **Level ${newLvl}**!`,
+      '',
+      `Next level progress`,
+      `${bar(pct)}  \`${Math.round(pct*100)}%\``
+    ].join('\n'))
+    .setFooter({ text: 'Keep the streak alive for bonus XP! 🔥' });
+
   let ch = null;
   if (store.config.levelUpChannelId) ch = await client.channels.fetch(store.config.levelUpChannelId).catch(()=>null);
   if (!ch) ch = interaction.channel;
+  ch?.send({ embeds:[levelEmb] }).catch(()=>{});
 
-  const levelEmb = new EmbedBuilder()
-    .setTitle('🆙 LEVEL UP!')
-    .setColor(0x7CFC00)
-    .setDescription(`<@${userObj.id}> reached **Level ${newLvl}**!`)
-    .setFooter({ text: 'Keep pushing! Tokens fuel adventures. 💪' });
-  if (ch) ch.send({ embeds:[levelEmb] }).catch(()=>{});
-
+  // Big extra blast for title milestones
   if (granted.length) {
     const roleEmb = new EmbedBuilder()
-      .setTitle('🎖️ MILESTONE ACHIEVED!')
+      .setTitle('🏅 **TITLE UNLOCKED!** 🏅')
       .setColor(0xFFD700)
-      .setDescription([
-        `🌟 **${granted.join(', ')}** awarded to <@${userObj.id}>!`,
-        '',
-        `**Level ${newLvl}** unlocked a new title.`,
-        '🔥 Keep the streak alive for bonus XP!'
-      ].join('\n'));
-    if (ch) ch.send({ embeds:[roleEmb] }).catch(()=>{});
+      .setDescription(`**${granted.join(', ')}** awarded to <@${userObj.id}>`)
+      .setFooter({ text: 'Huge milestone! 🥳' });
+    ch?.send({ embeds:[roleEmb] }).catch(()=>{});
   }
 }
 
 /* ---------------- Ready / Register / Scheduler ---------------- */
 client.once('ready', async () => {
   console.log(`🤖 Logged in as ${client.user.tag}`);
-  keepAlive(); // ping Render URL every 5 min
+  keepAlive();           // ping Render URL every 5 min
+  startPresenceRotation();
 
   try {
     await mongoConnect();
@@ -824,3 +935,10 @@ client.once('ready', async () => {
 
 /* ---------------- Login ---------------- */
 client.login(token);
+
+/* ---------------- Graceful shutdown ---------------- */
+process.on('SIGTERM', async () => {
+  console.log('Shutting down…');
+  try { await mongoClient?.close(); } catch {}
+  process.exit(0);
+});
