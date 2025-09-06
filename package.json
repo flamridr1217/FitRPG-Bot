@@ -1,0 +1,13 @@
+{
+  "name": "fitrpg-bot",
+  "version": "1.0.0",
+  "description": "Discord fitness RPG bot",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.15.3"
+  }
+}
