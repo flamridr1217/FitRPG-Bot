@@ -3,7 +3,7 @@
 // - Keep-alive pinger (prevents Render free from sleeping)
 // - Reconnect hooks for Discord + Mongo
 // - Rotating presence tips (mobile onboarding)
-// - XP model (slightly buffed) + softened curve (targets ~16–18 mo -> L500 with steady work)
+// - XP model (slightly buffed) + softened curve (targets ~16–18 mo -> L500 steady work)
 // - Role ladder to 1000 (Novice -> Transcendent)
 // - Tokens from logs -> Adventures (loot-first; trinkets rare)
 // - Expanded Shop (paged), Inventory, Gear, Consumables (+ /use)
@@ -11,7 +11,7 @@
 // - Simple Raids
 // - Mobile-first shortcuts: /p /plank /runmiles + /quicklog + /logmenu (buttons + modal)
 // - QoL: /help /ping /leaderboard
-// - NEW: Welcome Announcements on member join (+ /setwelcome), optional auto-assign Novice
+// - Welcome Announcements on member join (+ /setwelcome), auto-assign Novice, pin & reactions
 // - Reliability: rate limit, error guards, daily de-dupe, atomic saves, graceful shutdown
 
 const {
@@ -38,7 +38,7 @@ function keepAlive(){
   if (!url) return;
   setInterval(() => {
     try { https.get(url, res => res.resume()); } catch {}
-  }, 5 * 60 * 1000); // every 5 min
+  }, 5 * 60 * 1000);
 }
 
 /* ---------------- ENV ---------------- */
@@ -63,9 +63,6 @@ async function mongoConnect() {
   colUsers = mongoDb.collection('users'); // {_id:userId, data:{...}}
   colState = mongoDb.collection('state'); // {_id:'global', store:{...}}
   console.log('✅ MongoDB connected');
-
-  mongoClient.on?.('topologyClosed', () => console.warn('⚠️ Mongo topology closed'));
-  mongoClient.on?.('serverHeartbeatFailed', () => console.warn('⚠️ Mongo heartbeat failed'));
 }
 async function mongoLoadGlobal() {
   if (!colState) return;
@@ -95,16 +92,11 @@ async function mongoHydrateUser(id) {
 
 /* ---------------- Client ---------------- */
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers // required for welcome joins
-  ]
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] // members intent required for joins
 });
-
-/* Reconnect visibility */
-client.on('shardDisconnect', (event, id) => console.warn(`⚠️ Shard ${id} disconnected:`, event?.code));
+client.on('shardDisconnect', (e, id) => console.warn(`⚠️ Shard ${id} disconnected:`, e?.code));
 client.on('shardReconnecting', id => console.log(`🔁 Shard ${id} reconnecting...`));
-client.on('shardResume', (id, replayed) => console.log(`✅ Shard ${id} resumed. Replayed ${replayed} events.`));
+client.on('shardResume', (id, n) => console.log(`✅ Shard ${id} resumed. Replayed ${n} events.`));
 client.on('error', err => console.error('CLIENT_ERROR', err));
 client.on('warn', w => console.warn('CLIENT_WARN', w));
 
@@ -112,9 +104,8 @@ client.on('warn', w => console.warn('CLIENT_WARN', w));
 let store = {
   users: {},
   shop: { items: [] },
-  raids: { active: null }, // { hp, joined:[], shield?:number }
-  _todayDaily: null,       // { date, theme, tasks:[{...}] }
-  _lastDailyKey: null,
+  raids: { active: null },
+  _todayDaily: null, _lastDailyKey: null,
   config: {
     levelRoles: [
       { level: 1,    roleName: 'Novice' },
@@ -132,7 +123,7 @@ let store = {
     ],
     levelUpChannelId: null,
     dailyChannelId: null,
-    welcomeChannelId: null, // <— NEW
+    welcomeChannelId: null,
     logCooldownSec: 10,
     adventureCooldownSec: 15,
     raidHitCooldownSec: 8,
@@ -140,8 +131,8 @@ let store = {
   }
 };
 
-/* ---------------- Save helpers (DB first, /tmp fallback for local dev) ---------------- */
-const DATA_FILE = path.join('/tmp', 'data.json'); // fallback only on local
+/* ---------------- Save helpers ---------------- */
+const DATA_FILE = path.join('/tmp', 'data.json'); // local fallback
 let _saveTimer = null;
 function atomicWrite(file, data) {
   const tmp = file + '.tmp';
@@ -161,10 +152,6 @@ function saveSoon(ms = 300) {
   clearTimeout(_saveTimer);
   _saveTimer = setTimeout(() => { saveAll().catch(()=>{}); }, ms);
 }
-function backup() {
-  try { if (!colState) fs.copyFileSync(DATA_FILE, DATA_FILE.replace(/data\.json$/,'backup.json')); }
-  catch (e) { console.error('BACKUP_ERROR', e); }
-}
 
 /* ---------------- Utils ---------------- */
 function norm(s){ return String(s||'').trim().toLowerCase().replace(/\s+/g,'_'); }
@@ -177,7 +164,7 @@ function bar(p, len=16){
   return '▰'.repeat(filled) + '▱'.repeat(len - filled);
 }
 
-/* ---------------- Rotating Presence (mobile onboarding) ---------------- */
+/* ---------------- Rotating Presence ---------------- */
 const presenceTips = [
   'Type /logmenu on mobile',
   'Loot runs: /adventure',
@@ -188,12 +175,9 @@ const presenceTips = [
 function startPresenceRotation() {
   let i = 0;
   setInterval(() => {
-    client.user?.setPresence({
-      activities: [{ name: presenceTips[i % presenceTips.length] }],
-      status: 'online'
-    });
+    client.user?.setPresence({ activities: [{ name: presenceTips[i % presenceTips.length] }], status: 'online' });
     i++;
-  }, 60 * 1000); // rotate every minute
+  }, 60 * 1000);
 }
 
 /* ---------------- Users ---------------- */
@@ -202,27 +186,23 @@ function ensureUser(id){
     xp:0, coins:0, tokens:0,
     inventory:[], equipped:{weapon:null,armor:null,trinket:null,cosmetic:null},
     lastLog:0, lastAdventure:0, lastRaidHit:0, lastActiveISO:null, streak:0,
-    dailyProgress: {}, _buffs:{} // e.g., { doubleNextLog:true, guaranteedLoot:true }
+    dailyProgress: {}, _buffs:{} // { doubleNextLog, guaranteedLoot }
   };
   return store.users[id];
 }
 
-/* ---------------- XP Model & Levels (buffed ~10%, softened curve) ---------------- */
+/* ---------------- XP Model & Levels ---------------- */
 const BUILT_INS = {
-  // bodyweight
-  pushups:{ unit:'reps', rate:0.55 }, // was 0.50
-  pullups:{ unit:'reps', rate:2.20 }, // was 2.00
-  situps:{ unit:'reps', rate:0.44 },  // was 0.40
-  squats:{ unit:'reps', rate:0.44 },  // was 0.40
-  lunges:{ unit:'reps', rate:0.50 },  // was 0.45
-  burpees:{ unit:'reps', rate:1.30 }, // was 1.20
-  dips:{ unit:'reps', rate:1.75 },    // was 1.60
-  // time
-  plank:{ unit:'seconds', rate:0.22 }, // was 0.20
-  // cardio
-  run_miles:{ unit:'miles', rate:44 }  // was 40
+  pushups:{ unit:'reps', rate:0.55 },
+  pullups:{ unit:'reps', rate:2.20 },
+  situps:{ unit:'reps', rate:0.44 },
+  squats:{ unit:'reps', rate:0.44 },
+  lunges:{ unit:'reps', rate:0.50 },
+  burpees:{ unit:'reps', rate:1.30 },
+  dips:{ unit:'reps', rate:1.75 },
+  plank:{ unit:'seconds', rate:0.22 },
+  run_miles:{ unit:'miles', rate:44 }
 };
-// Slightly easier curve than before; still long-tail to L1000
 function xpToNextLevel(n){ return Math.floor(22 + 1.1*(n+1) + 0.14*Math.pow(n+1, 1.05)); }
 function levelFromXp(xp){
   let lvl=0,total=0;
@@ -245,7 +225,6 @@ process.on('uncaughtException', (e)=>{ console.error('UNCAUGHT', e); process.exi
 /* ---------------- Shop (expanded & paged) ---------------- */
 function buildShopItems(){
   const items = [];
-  // Weapons (T1–T6)
   const weapons = [
     { name:'Training Gloves', atk:1, price:40, tier:1 },
     { name:'Stick', atk:1, price:50, tier:1 },
@@ -264,7 +243,6 @@ function buildShopItems(){
     { name:'Celestial Halberd', atk:28, price:2500, tier:5 },
     { name:'Aether Katana', atk:34, price:3200, tier:6 },
   ].map(w => ({ type:'weapon', ...w }));
-  // Armor (T1–T6)
   const armors = [
     { name:'Cloth Wraps', def:1, price:50, tier:1 },
     { name:'Cloth Tunic', def:1, price:80, tier:1 },
@@ -279,7 +257,6 @@ function buildShopItems(){
     { name:'Voidforged Mail', def:25, price:2500, tier:5 },
     { name:'Aether Ward', def:30, price:3100, tier:6 },
   ].map(a => ({ type:'armor', ...a }));
-  // Trinkets (rare)
   const trinkets = [
     { name:'Lucky Coin', bonus:'+5% coin gain', price:1500, tier:4 },
     { name:'Runner’s Band', bonus:'+5% run XP', price:1600, tier:4 },
@@ -287,17 +264,16 @@ function buildShopItems(){
     { name:'Phoenix Feather', bonus:'1 auto-res in raid', price:2500, tier:5 },
     { name:'Meteor Charm', bonus:'+3% all XP', price:2800, tier:6 },
   ].map(t => ({ type:'trinket', ...t }));
-  // Consumables
   const consumables = [
     { name:'Health Potion', effect:'restore team shield in raid', price:50 },
     { name:'Energy Drink', effect:'double XP for next log', price:150 },
     { name:'Treasure Map', effect:'guaranteed loot on next adventure', price:200 },
     { name:'Stamina Brew', effect:'+1 adventure token', price:250 },
   ].map(c => ({ type:'consumable', ...c }));
-  items.push(...weapons, ...armors, ...trinkets, ...consumables);
-  return items;
+  return [...weapons, ...armors, ...trinkets, ...consumables];
 }
 function shopEmbed(page=0){
+  store.shop.items = store.shop.items?.length ? store.shop.items : buildShopItems();
   const perPage=8;
   const totalPages = Math.max(1, Math.ceil(store.shop.items.length/perPage));
   const p = Math.min(Math.max(0, page), totalPages-1);
@@ -435,7 +411,7 @@ async function postDailyChallenge(){
       }
     }catch(e){ console.error('DAILY_POST_ERROR', e); }
   }
-  try { await saveAll(); backup(); } catch(e){ console.error('POST_SAVE_BACKUP_ERR', e); }
+  try { await saveAll(); } catch(e){ console.error('POST_SAVE_ERR', e); }
 }
 function startDailyScheduler(){
   setInterval(async ()=>{
@@ -507,7 +483,6 @@ const commands = [
     .addIntegerOption(o=>o.setName('hour').setDescription('0–23').setRequired(true))
     .addIntegerOption(o=>o.setName('minute').setDescription('0–59').setRequired(true)),
 
-  // NEW: setwelcome channel
   new SlashCommandBuilder().setName('setwelcome').setDescription('Set the welcome announcement channel')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addChannelOption(opt => opt.setName('channel').setDescription('Channel to post welcomes in').setRequired(true)),
@@ -524,7 +499,6 @@ client.on('interactionCreate', async interaction => {
   try {
     switch(interaction.commandName){
 
-      /* QoL */
       case 'ping': {
         const api = Math.round(client.ws.ping);
         const t0 = Date.now();
@@ -614,17 +588,17 @@ client.on('interactionCreate', async interaction => {
 
       /* Shop / Inventory / Gear / Use */
       case 'shop': {
-        store.shop.items = store.shop.items?.length ? store.shop.items : buildShopItems();
         const page = interaction.options.getInteger('page')||0;
         return interaction.reply({ embeds:[shopEmbed(page)] });
       }
       case 'buy': {
         const name = interaction.options.getString('item');
+        store.shop.items = store.shop.items?.length ? store.shop.items : buildShopItems();
         const item = store.shop.items.find(i=>i.name.toLowerCase()===name.toLowerCase());
         if(!item) return interaction.reply({ content:'❌ Item not found.', ephemeral:true });
-        if(user.coins<item.price) return interaction.reply({ content:'💸 Not enough coins.', ephemeral:true });
-        user.coins -= item.price;
-        user.inventory.push(item.name);
+        const u = ensureUser(interaction.user.id);
+        if(u.coins<item.price) return interaction.reply({ content:'💸 Not enough coins.', ephemeral:true });
+        u.coins -= item.price; u.inventory.push(item.name);
         saveSoon();
         return interaction.reply(`✅ You bought **${item.name}**!`);
       }
@@ -635,8 +609,8 @@ client.on('interactionCreate', async interaction => {
         const name = interaction.options.getString('item');
         if(!user.inventory.includes(name)) return interaction.reply({ content:'❌ You don\'t own that.', ephemeral:true });
         const n = name.toLowerCase();
-        if(/sword|axe|bow|spear|dagger|blade|halberd|hammer|gloves/.test(n)) user.equipped.weapon=name;
-        else if(/armor|plate|mail|tunic|vest|hide|scale|ward|wraps/.test(n)) user.equipped.armor=name;
+        if(/sword|axe|bow|spear|dagger|blade|halberd|hammer|gloves|stick/.test(n)) user.equipped.weapon=name;
+        else if(/armor|plate|mail|tunic|vest|hide|scale|ward|wraps|chain/.test(n)) user.equipped.armor=name;
         else if(/coin|band|amulet|feather|charm/.test(n)) user.equipped.trinket=name;
         else return interaction.reply({ content:'❌ That item cannot be equipped.', ephemeral:true });
         saveSoon();
@@ -652,21 +626,13 @@ client.on('interactionCreate', async interaction => {
           user._buffs.doubleNextLog = true;
           msg = '⚡ Energy surges! Your **next log gives double XP**.';
         } else if(lower==='stamina brew'){
-          user.tokens += 1;
-          msg = '🧪 You feel ready! **+1 Adventure Token**.';
+          user.tokens += 1; msg = '🧪 You feel ready! **+1 Adventure Token**.';
         } else if(lower==='treasure map'){
-          user._buffs.guaranteedLoot = true;
-          msg = '🗺️ You study the map. Your **next adventure will guarantee loot**.';
+          user._buffs.guaranteedLoot = true; msg = '🗺️ Your **next adventure will guarantee loot**.';
         } else if(lower==='health potion'){
-          if(store.raids.active){
-            store.raids.active.shield = (store.raids.active.shield||0) + 100;
-            msg = '🛡️ Team shield restored by **100** for the active raid.';
-          } else {
-            msg = '🛡️ You feel rejuvenated… (Best used during an active raid.)';
-          }
-        } else {
-          return interaction.reply({ content:'❌ Unknown consumable.', ephemeral:true });
-        }
+          if(store.raids.active){ store.raids.active.shield = (store.raids.active.shield||0) + 100; msg = '🛡️ Team shield +100 (raid).'; }
+          else msg = '🛡️ You feel rejuvenated… (Best used during an active raid.)';
+        } else return interaction.reply({ content:'❌ Unknown consumable.', ephemeral:true });
         user.inventory.splice(idx,1);
         saveSoon();
         return interaction.reply(`🍹 Used **${name}** — ${msg}`);
@@ -689,7 +655,7 @@ client.on('interactionCreate', async interaction => {
         break;
       }
 
-      /* Raids (simple placeholder) */
+      /* Raids */
       case 'raid': {
         const sub=interaction.options.getSubcommand();
         if(sub==='start'){
@@ -708,8 +674,7 @@ client.on('interactionCreate', async interaction => {
           const dmg=R(20,50);
           store.raids.active.hp-=dmg;
           if(store.raids.active.hp<=0){
-            store.raids.active=null;
-            saveSoon();
+            store.raids.active=null; saveSoon();
             return interaction.reply(`⚔️ You dealt ${dmg} dmg and the boss is **defeated**! Everyone rejoice!`);
           }
           saveSoon();
@@ -830,16 +795,14 @@ client.on('interactionCreate', async i=>{
 });
 
 /* ---------------- Logging helper (XP, boosts, tokens, streak, level-ups) ---------------- */
-async function doWorkoutLog(interaction, user, type, amount, baseXp, unitLabel, fromMenu=false){
+async function doWorkoutLog(interaction, user, type, amount, baseXp, unitLabel){
   if (!Number.isFinite(amount) || amount<=0) {
-    const content='⚠️ Enter a positive number.';
-    return interaction.reply({ content, ephemeral:true });
+    return interaction.reply({ content:'⚠️ Enter a positive number.', ephemeral:true });
   }
   const now = Date.now();
   if (now - user.lastLog < (store.config.logCooldownSec||10)*1000) {
     const wait = Math.ceil(((store.config.logCooldownSec*1000)-(now-user.lastLog))/1000);
-    const content = `⏳ Logging too fast. Try again in ${wait}s.`;
-    return interaction.reply({ content, ephemeral:true });
+    return interaction.reply({ content:`⏳ Logging too fast. Try again in ${wait}s.`, ephemeral:true });
   }
 
   const preLevel = levelFromXp(user.xp);
@@ -870,8 +833,7 @@ async function doWorkoutLog(interaction, user, type, amount, baseXp, unitLabel, 
   const postLevel = levelFromXp(user.xp);
   if (postLevel > preLevel) await onLevelUp(interaction, { id: interaction.user?.id || interaction.userId }, user, preLevel, postLevel);
 
-  const reply = `✅ Logged **${amount} ${unitLabel||type}** → +${xpGain} XP, +1 token (now ${user.tokens})`;
-  return interaction.reply(reply);
+  return interaction.reply(`✅ Logged **${amount} ${unitLabel||type}** → +${xpGain} XP, +1 token (now ${user.tokens})`);
 }
 
 /* ---------------- Level-ups: roles & flashy announcements ---------------- */
@@ -898,7 +860,6 @@ async function onLevelUp(interaction, userObj, userData, oldLvl, newLvl){
   const into = userData.xp - spent;
   const pct = reqNext>0 ? into/reqNext : 1;
 
-  // Level-up embed
   const levelEmb = new EmbedBuilder()
     .setTitle('🎆 **LEVEL UP!** 🎆')
     .setColor(0x7CFC00)
@@ -915,7 +876,6 @@ async function onLevelUp(interaction, userObj, userData, oldLvl, newLvl){
   if (!ch) ch = interaction.channel;
   ch?.send({ embeds:[levelEmb] }).catch(()=>{});
 
-  // Big extra blast for title milestones
   if (granted.length) {
     const roleEmb = new EmbedBuilder()
       .setTitle('🏅 **TITLE UNLOCKED!** 🏅')
@@ -926,7 +886,7 @@ async function onLevelUp(interaction, userObj, userData, oldLvl, newLvl){
   }
 }
 
-/* ---------------- NEW: Welcome announcements on member join ---------------- */
+/* ---------------- Welcome announcements (EXACT vibe + /help tip, pin, reactions) ---------------- */
 client.on('guildMemberAdd', async member => {
   const channelId = store.config.welcomeChannelId;
   if (!channelId) return; // not configured
@@ -936,10 +896,23 @@ client.on('guildMemberAdd', async member => {
   const emb = new EmbedBuilder()
     .setTitle('🎉 NEW HERO JOINS THE PARTY! 🎉')
     .setColor(0x00ff99)
-    .setDescription(`Welcome <@${member.id}> to **FitRPG**!\n\nYou begin as a **Novice**. Start logging with \`/logmenu\` and claim your destiny 💪🔥`)
-    .setThumbnail(member.user.displayAvatarURL());
+    .setDescription(
+      [
+        `Everyone, give a huge flex 💪 to <@${member.id}> who just joined our squad!`,
+        '',
+        `You’re starting as a **Novice** — log workouts with \`/logmenu\` to level up, earn loot, and climb the leaderboard.`,
+        '',
+        `💡 Tip: Type \`/help\` any time for a full list of commands.`
+      ].join('\n')
+    )
+    .setThumbnail(member.user.displayAvatarURL())
+    .setFooter({ text: 'Welcome to the FitRPG adventure!' });
 
-  ch.send({ embeds:[emb] }).catch(()=>{});
+  const sent = await ch.send({ embeds:[emb] }).catch(()=>null);
+  if (sent) {
+    try { await sent.pin(); } catch {}
+    try { await sent.react('🎉'); await sent.react('💪'); } catch {}
+  }
 
   // Optional auto-assign Novice (if role exists and bot role is high enough)
   const noviceRole = member.guild.roles.cache.find(r => r.name === 'Novice');
@@ -949,7 +922,7 @@ client.on('guildMemberAdd', async member => {
 /* ---------------- Ready / Register / Scheduler ---------------- */
 client.once('ready', async () => {
   console.log(`🤖 Logged in as ${client.user.tag}`);
-  keepAlive();           // ping Render URL every 5 min
+  keepAlive();
   startPresenceRotation();
 
   try {
