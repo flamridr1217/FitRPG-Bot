@@ -1,8 +1,18 @@
 // FitRPG Bot — XP Levels + Coins + Shop + Inventory + Equip + Leaderboard
-// Requires: discord.js ^14 (package.json from earlier is fine)
+// Requires: discord.js ^14
 
 const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, PermissionsBitField } = require('discord.js');
 const fs = require('fs');
+
+// --- keep Render happy on a Web Service by opening a small HTTP server ---
+const http = require('http');
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  res.writeHead(200, {'Content-Type': 'text/plain'});
+  res.end('FitRPG bot is running.\n');
+}).listen(PORT, () => {
+  console.log(`Health server listening on port ${PORT}`);
+});
 
 const token = process.env.DISCORD_TOKEN;
 const clientId = process.env.CLIENT_ID; // Application (Client) ID
@@ -13,10 +23,10 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 /* ---------------- Storage ---------------- */
 const DATA_FILE = 'data.json';
 let store = {
-  users: {},             // userId -> { xp, coins, inventory:[], equipped:{weapon:null, cosmetic:null}, lastLog }
-  customExercises: {},   // (future use if you want to add custom)
-  shop: { items: [] },   // filled below
-  config: {              // level roles & thresholds
+  users: {},
+  customExercises: {},
+  shop: { items: [] },
+  config: {
     levelRoles: [
       { level: 1,  roleName: 'Novice' },
       { level: 5,  roleName: 'Apprentice' },
@@ -28,55 +38,42 @@ let store = {
   }
 };
 
-// load existing
 if (fs.existsSync(DATA_FILE)) {
   try { store = { ...store, ...JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')) }; } catch {}
 }
 function save() { fs.writeFileSync(DATA_FILE, JSON.stringify(store, null, 2)); }
 
 /* ---------------- Exercises & XP ---------------- */
-
-// Built-ins and unit defaults. You can tweak rates here.
 const BUILT_INS = {
-  // bodyweight reps
-  pushups:       { unit: 'reps',    rate: 0.5 },
-  situps:        { unit: 'reps',    rate: 0.5 },
-  squats:        { unit: 'reps',    rate: 0.5 },
-  lunges:        { unit: 'reps',    rate: 0.6 },
-  burpees:       { unit: 'reps',    rate: 1.0 },
-  pullups:       { unit: 'reps',    rate: 1.5 },
-  dips:          { unit: 'reps',    rate: 1.5 },
-
-  // time
-  plank:         { unit: 'seconds', rate: 0.2 },  // 60s = 12 XP
-
-  // cardio
-  run_miles:     { unit: 'miles',   rate: 20   },
-  run:           { unit: 'minutes', rate: 0.17 },
-  cycle_miles:   { unit: 'miles',   rate: 8    },
-  row_minutes:   { unit: 'minutes', rate: 0.25 },
-  swim_laps:     { unit: 'laps',    rate: 15   },
-
-  // weighted lifts
-  bench:         { unit: 'weighted_reps', rateWeight: 0.02 }, // XP = 0.02 * (lb * reps)
-  legpress:      { unit: 'weighted_reps', rateWeight: 0.02 },
-  deadlift:      { unit: 'weighted_reps', rateWeight: 0.02 },
+  pushups: { unit: 'reps', rate: 0.5 },
+  situps: { unit: 'reps', rate: 0.5 },
+  squats: { unit: 'reps', rate: 0.5 },
+  lunges: { unit: 'reps', rate: 0.6 },
+  burpees: { unit: 'reps', rate: 1.0 },
+  pullups: { unit: 'reps', rate: 1.5 },
+  dips: { unit: 'reps', rate: 1.5 },
+  plank: { unit: 'seconds', rate: 0.2 },
+  run_miles: { unit: 'miles', rate: 20 },
+  run: { unit: 'minutes', rate: 0.17 },
+  cycle_miles: { unit: 'miles', rate: 8 },
+  row_minutes: { unit: 'minutes', rate: 0.25 },
+  swim_laps: { unit: 'laps', rate: 15 },
+  bench: { unit: 'weighted_reps', rateWeight: 0.02 },
+  legpress: { unit: 'weighted_reps', rateWeight: 0.02 },
+  deadlift: { unit: 'weighted_reps', rateWeight: 0.02 },
   squat_barbell: { unit: 'weighted_reps', rateWeight: 0.02 },
-  ohp:           { unit: 'weighted_reps', rateWeight: 0.02 }, // overhead press
-
-  // session bonus
+  ohp: { unit: 'weighted_reps', rateWeight: 0.02 },
   strengthsession: { unit: 'sessions', rate: 25 }
 };
 
-// If an exercise isn’t in BUILT_INS, fall back by unit
 const UNIT_DEFAULTS = {
-  reps:     0.5,
-  seconds:  0.2,
-  minutes:  0.2,
-  miles:    12,
-  km:       7.5,
-  meters:   0.012, // ~1.2 XP per 100m
-  laps:     10,
+  reps: 0.5,
+  seconds: 0.2,
+  minutes: 0.2,
+  miles: 12,
+  km: 7.5,
+  meters: 0.012,
+  laps: 10,
   sessions: 25
 };
 
@@ -87,27 +84,22 @@ function toLbs(weight, unit) {
   if (unit === 'kg') return weight * 2.2046226218;
   return weight;
 }
-
 function computeXP({ exercise, amount, unit, weight, weightUnit }) {
   const key = norm(exercise);
   const cfg = BUILT_INS[key] || store.customExercises[key];
-
-  // weighted lifts
   if (cfg && cfg.unit === 'weighted_reps') {
     const reps = amount;
     const lbs = toLbs(weight || 0, weightUnit);
     const xp = (cfg.rateWeight || 0.02) * (lbs * reps);
     return { xp, basis: `weighted: ${reps} reps @ ${lbs.toFixed(1)} lb` };
   }
-
   const useUnit = unit || (cfg ? cfg.unit : null);
   const rate = (cfg && cfg.rate) ?? UNIT_DEFAULTS[useUnit || 'reps'];
   const xp = (amount || 0) * (rate || 0);
   return { xp, basis: `${amount} ${useUnit || (cfg ? cfg.unit : 'units')}` };
 }
 
-/* ---------------- Levels & Roles ---------------- */
-
+/* ---------------- Levels ---------------- */
 function levelFromXp(xp) {
   xp = Number(xp || 0);
   let lvl = 0, rem = xp;
@@ -123,104 +115,50 @@ async function grantLevelRoles(guild, member, prevLevel, newLevel) {
     if (prevLevel < th.level && newLevel >= th.level) {
       const role = guild.roles.cache.find(r => r.name === th.roleName);
       if (role) {
-        try {
-          await member.roles.add(role.id, 'Level-up reward');
-        } catch (e) {
-          // If the bot can’t assign, it probably needs its role moved higher or Manage Roles
-          console.warn('Role add error:', e.message);
-        }
+        try { await member.roles.add(role.id, 'Level-up reward'); }
+        catch (e) { console.warn('Role add error:', e.message); }
       }
     }
   }
 }
 
-/* ---------------- Shop & Inventory ---------------- */
-
-// Preload a simple shop if empty:
+/* ---------------- Shop ---------------- */
 if (!store.shop.items || store.shop.items.length === 0) {
   store.shop.items = [
-    // Weapons (cosmetic power only)
-    { key: 'wooden_sword',  name: 'Wooden Sword',  type: 'weapon',   price: 50,  power: 2,  desc: 'Starter blade.' },
-    { key: 'iron_sword',    name: 'Iron Sword',    type: 'weapon',   price: 150, power: 5,  desc: 'Reliable steel.' },
-    { key: 'war_hammer',    name: 'War Hammer',    type: 'weapon',   price: 400, power: 9,  desc: 'Bonk with style.' },
-    { key: 'dragon_lance',  name: 'Dragon Lance',  type: 'weapon',   price: 900, power: 15, desc: 'Legend-tier.' },
-
-    // Cosmetics (optionally grant a Discord role if present)
-    { key: 'color_royal',   name: 'Royal Color',   type: 'cosmetic', price: 120, desc: 'Royal flair.',
-      roleReward: 'Royal' },
-    { key: 'title_champion',name: 'Title: Champion', type: 'cosmetic', price: 300, desc: 'Show off your title.',
-      roleReward: 'Title: Champion' }
+    { key: 'wooden_sword',  name: 'Wooden Sword',  type: 'weapon', price: 50,  power: 2,  desc: 'Starter blade.' },
+    { key: 'iron_sword',    name: 'Iron Sword',    type: 'weapon', price: 150, power: 5,  desc: 'Reliable steel.' },
+    { key: 'war_hammer',    name: 'War Hammer',    type: 'weapon', price: 400, power: 9,  desc: 'Bonk with style.' },
+    { key: 'dragon_lance',  name: 'Dragon Lance',  type: 'weapon', price: 900, power: 15, desc: 'Legend-tier.' },
+    { key: 'color_royal',   name: 'Royal Color',   type: 'cosmetic', price: 120, desc: 'Royal flair.', roleReward: 'Royal' },
+    { key: 'title_champion',name: 'Title: Champion', type: 'cosmetic', price: 300, desc: 'Show off your title.', roleReward: 'Title: Champion' }
   ];
   save();
 }
 
-/* ---------------- Slash Commands ---------------- */
+/* ---------------- Commands ---------------- */
 const commands = [
-  // Log any workout (like before)
-  new SlashCommandBuilder()
-    .setName('log')
-    .setDescription('Log a workout and earn XP/coins')
+  new SlashCommandBuilder().setName('log').setDescription('Log a workout and earn XP/coins')
     .addStringOption(o => o.setName('exercise').setDescription('e.g. pushups, run_miles, bench').setRequired(true))
     .addNumberOption(o => o.setName('amount').setDescription('Reps / seconds / minutes / miles / etc.').setRequired(true))
-    .addStringOption(o => o.setName('unit').setDescription('reps, seconds, minutes, miles, km, meters, laps, sessions, weighted_reps')
+    .addStringOption(o => o.setName('unit').setDescription('Unit')
       .addChoices(
-        { name: 'reps', value: 'reps' },
-        { name: 'seconds', value: 'seconds' },
-        { name: 'minutes', value: 'minutes' },
-        { name: 'miles', value: 'miles' },
-        { name: 'km', value: 'km' },
-        { name: 'meters', value: 'meters' },
-        { name: 'laps', value: 'laps' },
-        { name: 'sessions', value: 'sessions' },
+        { name: 'reps', value: 'reps' }, { name: 'seconds', value: 'seconds' },
+        { name: 'minutes', value: 'minutes' }, { name: 'miles', value: 'miles' },
+        { name: 'km', value: 'km' }, { name: 'meters', value: 'meters' },
+        { name: 'laps', value: 'laps' }, { name: 'sessions', value: 'sessions' },
         { name: 'weighted_reps (for barbell lifts)', value: 'weighted_reps' }
-      )
-      .setRequired(false))
-    .addNumberOption(o => o.setName('weight').setDescription('For weighted lifts').setRequired(false))
-    .addStringOption(o => o.setName('weight_unit').setDescription('lb or kg')
-      .addChoices({ name: 'lb', value: 'lb' }, { name: 'kg', value: 'kg' })
-      .setRequired(false)),
-
-  // Show personal stats
-  new SlashCommandBuilder()
-    .setName('stats')
-    .setDescription('Show your XP / Level / Coins'),
-
-  // Exercises help
-  new SlashCommandBuilder()
-    .setName('exercises')
-    .setDescription('See built-in exercise keys and unit defaults'),
-
-  // Leaderboard
-  new SlashCommandBuilder()
-    .setName('leaderboard')
-    .setDescription('Top 10 by XP'),
-
-  // Coins & Shop
-  new SlashCommandBuilder()
-    .setName('coins')
-    .setDescription('Show your coin balance'),
-
-  new SlashCommandBuilder()
-    .setName('shop')
-    .setDescription('Browse items to buy'),
-
-  new SlashCommandBuilder()
-    .setName('buy')
-    .setDescription('Buy an item from the shop')
-    .addStringOption(o => o.setName('item_key').setDescription('Item key from /shop').setRequired(true)),
-
-  new SlashCommandBuilder()
-    .setName('inventory')
-    .setDescription('See your items'),
-
-  new SlashCommandBuilder()
-    .setName('equip')
-    .setDescription('Equip a weapon or cosmetic by key')
-    .addStringOption(o => o.setName('item_key').setDescription('Item key from your inventory').setRequired(true))
+      )),
+  new SlashCommandBuilder().setName('stats').setDescription('Show your XP / Level / Coins'),
+  new SlashCommandBuilder().setName('exercises').setDescription('See built-in exercise keys and unit defaults'),
+  new SlashCommandBuilder().setName('leaderboard').setDescription('Top 10 by XP'),
+  new SlashCommandBuilder().setName('coins').setDescription('Show your coin balance'),
+  new SlashCommandBuilder().setName('shop').setDescription('Browse items to buy'),
+  new SlashCommandBuilder().setName('buy').setDescription('Buy an item').addStringOption(o => o.setName('item_key').setRequired(true)),
+  new SlashCommandBuilder().setName('inventory').setDescription('See your items'),
+  new SlashCommandBuilder().setName('equip').setDescription('Equip an item').addStringOption(o => o.setName('item_key').setRequired(true))
 ].map(c => c.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(token);
-
 async function registerCommands() {
   await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: commands });
   console.log('✅ Commands registered');
@@ -231,191 +169,82 @@ client.once('ready', () => {
   registerCommands().catch(console.error);
 });
 
-/* ---------------- Utilities ---------------- */
+/* ---------------- Interaction Handler ---------------- */
 function ensureUser(id) {
   if (!store.users[id]) store.users[id] = { xp: 0, coins: 0, inventory: [], equipped: { weapon: null, cosmetic: null }, lastLog: 0 };
   return store.users[id];
 }
 function clampXP(x) { return Math.max(0, Math.min(Number.isFinite(x) ? x : 0, 100000)); }
 
-/* ---------------- Interaction Handler ---------------- */
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
-
   try {
     // /log
     if (interaction.commandName === 'log') {
-      const exercise   = interaction.options.getString('exercise');
-      const amount     = interaction.options.getNumber('amount');
-      const unit       = interaction.options.getString('unit') || undefined;
-      const weight     = interaction.options.getNumber('weight') || undefined;
-      const weightUnit = interaction.options.getString('weight_unit') || undefined;
-
-      if (!exercise || !amount || amount <= 0) {
-        return interaction.reply({ content: 'Please provide a valid exercise and positive amount.', ephemeral: true });
-      }
-
+      const exercise = interaction.options.getString('exercise');
+      const amount = interaction.options.getNumber('amount');
+      const unit = interaction.options.getString('unit') || undefined;
       const me = ensureUser(interaction.user.id);
-      // cooldown
       const now = Date.now();
-      const diff = (now - (me.lastLog || 0)) / 1000;
-      if (diff < store.config.logCooldownSec) {
-        return interaction.reply({ content: `Slow down! Try again in ${Math.ceil(store.config.logCooldownSec - diff)}s.`, ephemeral: true });
-      }
-
-      // compute xp
-      const { xp, basis } = computeXP({ exercise, amount, unit, weight, weightUnit });
+      if ((now - me.lastLog) / 1000 < store.config.logCooldownSec) return interaction.reply({ content: 'Cooldown active.', ephemeral: true });
+      const { xp, basis } = computeXP({ exercise, amount, unit });
       const gain = clampXP(xp);
-      const prevXp = me.xp;
-      const prevLvl = levelFromXp(prevXp);
-
+      const prevLvl = levelFromXp(me.xp);
       me.xp += gain;
-      me.coins += Math.floor(gain / 10); // 1 coin per 10 XP
+      me.coins += Math.floor(gain / 10);
       me.lastLog = now;
       save();
-
       const newLvl = levelFromXp(me.xp);
-
-      // level role assignment
       if (newLvl > prevLvl) {
         try {
           const guild = await client.guilds.fetch(guildId);
           const member = await guild.members.fetch(interaction.user.id);
           await grantLevelRoles(guild, member, prevLvl, newLvl);
-        } catch (e) {
-          console.warn('Level role assignment issue:', e.message);
-        }
+        } catch {}
       }
-
-      const wStr = (weight && (unit === 'weighted_reps' || BUILT_INS[norm(exercise)]?.unit === 'weighted_reps'))
-        ? ` @ ${weight}${weightUnit || 'lb'}`
-        : '';
-
-      return interaction.reply(
-        `**${interaction.user.username}** logged **${amount} ${unit || BUILT_INS[norm(exercise)]?.unit || ''} ${exercise}${wStr}**\n` +
-        `• Basis: ${basis}\n` +
-        `• ✨ XP: **${gain.toFixed(1)}**  • 🪙 Coins: **${Math.floor(gain/10)}**\n` +
-        `• 🧬 Level: **${newLvl}** (Total XP: ${me.xp.toFixed(1)})`
-      );
+      return interaction.reply(`+${gain.toFixed(1)} XP (${basis}) — Level ${newLvl}, Coins: ${me.coins}`);
     }
-
     // /stats
     if (interaction.commandName === 'stats') {
       const me = ensureUser(interaction.user.id);
-      const lvl = levelFromXp(me.xp);
-      return interaction.reply(
-        `${interaction.user.username} — ` +
-        `✨ XP: **${me.xp.toFixed(1)}**  | 🧬 Level: **${lvl}**  | 🪙 Coins: **${me.coins}**\n` +
-        `${me.equipped.weapon ? `• Equipped Weapon: **${me.equipped.weapon}**\n` : ''}` +
-        `${me.equipped.cosmetic ? `• Cosmetic: **${me.equipped.cosmetic}**` : ''}`
-      );
+      return interaction.reply(`${interaction.user.username} — XP: ${me.xp}, Level: ${levelFromXp(me.xp)}, Coins: ${me.coins}`);
     }
-
-    // /exercises
-    if (interaction.commandName === 'exercises') {
-      const builtInKeys = Object.keys(BUILT_INS).sort().join(', ');
-      const unitDefaults = Object.entries(UNIT_DEFAULTS).map(([u, r]) => `${u}→${r}`).join(' • ');
-      return interaction.reply(
-        `**Built-ins**:\n${builtInKeys}\n\n` +
-        `**Unit defaults** (if exercise isn’t listed):\n${unitDefaults}\n\n` +
-        `Tip: Barbell lifts → unit **weighted_reps** + add weight. Example:\n` +
-        "`/log exercise:bench amount:5 unit:weighted_reps weight:185 weight_unit:lb`"
-      );
-    }
-
-    // /leaderboard
-    if (interaction.commandName === 'leaderboard') {
-      const rows = Object.entries(store.users)
-        .map(([id, u]) => ({ id, xp: Number(u.xp || 0) }))
-        .sort((a, b) => b.xp - a.xp)
-        .slice(0, 10);
-      if (rows.length === 0) return interaction.reply('No users yet.');
-      const lines = rows.map((r, i) => `${i + 1}. <@${r.id}> — ${r.xp.toFixed(1)} XP`);
-      return interaction.reply('🏆 **Top 10 by XP**\n' + lines.join('\n'));
-    }
-
-    // /coins
-    if (interaction.commandName === 'coins') {
-      const me = ensureUser(interaction.user.id);
-      return interaction.reply(`🪙 **${interaction.user.username}** has **${me.coins}** coins.`);
-    }
-
     // /shop
     if (interaction.commandName === 'shop') {
-      const lines = store.shop.items.map(it =>
-        `• **${it.name}** \`${it.key}\` — ${it.price} coins` +
-        (it.type === 'weapon' ? ` (power ${it.power})` : '') +
-        (it.desc ? ` — ${it.desc}` : '') +
-        (it.roleReward ? ` 〔Grants role: ${it.roleReward}〕` : '')
-      );
-      return interaction.reply(lines.length ? `🛒 **Shop**\n${lines.join('\n')}` : 'Shop is empty.');
+      return interaction.reply(store.shop.items.map(it => `• ${it.name} \`${it.key}\` — ${it.price} coins`).join('\n'));
     }
-
     // /buy
     if (interaction.commandName === 'buy') {
       const key = norm(interaction.options.getString('item_key'));
       const me = ensureUser(interaction.user.id);
       const item = store.shop.items.find(i => i.key === key);
-      if (!item) return interaction.reply({ content: 'Item not found. Use /shop to see keys.', ephemeral: true });
-      if (me.coins < item.price) return interaction.reply({ content: `Not enough coins. Need ${item.price}.`, ephemeral: true });
-
+      if (!item) return interaction.reply({ content: 'No such item.', ephemeral: true });
+      if (me.coins < item.price) return interaction.reply({ content: 'Not enough coins.', ephemeral: true });
       me.coins -= item.price;
       me.inventory.push(item.key);
       save();
-
-      // optional role reward
-      if (item.roleReward) {
-        try {
-          const guild = await client.guilds.fetch(guildId);
-          const role = guild.roles.cache.find(r => r.name === item.roleReward);
-          if (role) {
-            const member = await guild.members.fetch(interaction.user.id);
-            await member.roles.add(role.id, 'Shop purchase reward');
-          }
-        } catch (e) {
-          console.warn('Role reward error:', e.message);
-        }
-      }
-
-      return interaction.reply(`Purchased **${item.name}** for **${item.price}** coins. Check /inventory and /equip.`);
+      return interaction.reply(`Purchased ${item.name}!`);
     }
-
     // /inventory
     if (interaction.commandName === 'inventory') {
       const me = ensureUser(interaction.user.id);
-      if (!me.inventory.length) return interaction.reply('Your inventory is empty. Buy something from /shop!');
-      const lines = me.inventory.map(k => {
-        const it = store.shop.items.find(i => i.key === k);
-        return it ? `• ${it.name} \`${it.key}\`${it.type === 'weapon' ? ` (power ${it.power})` : ''}` : `• ${k}`;
-      });
-      return interaction.reply(`🎒 **Inventory**\n${lines.join('\n')}`);
+      return interaction.reply(me.inventory.length ? me.inventory.join(', ') : 'Inventory empty.');
     }
-
     // /equip
     if (interaction.commandName === 'equip') {
       const key = norm(interaction.options.getString('item_key'));
       const me = ensureUser(interaction.user.id);
-      if (!me.inventory.includes(key)) return interaction.reply({ content: 'You don’t own that item.', ephemeral: true });
-      const it = store.shop.items.find(i => i.key === key);
-      if (!it) return interaction.reply({ content: 'Unknown item.', ephemeral: true });
-
-      if (it.type === 'weapon') {
-        me.equipped.weapon = it.name;
-      } else if (it.type === 'cosmetic') {
-        me.equipped.cosmetic = it.name;
-      } else {
-        return interaction.reply({ content: 'This item cannot be equipped.', ephemeral: true });
-      }
+      if (!me.inventory.includes(key)) return interaction.reply({ content: 'You don’t own that.', ephemeral: true });
+      me.equipped.weapon = key;
       save();
-      return interaction.reply(`Equipped **${it.name}**.`);
+      return interaction.reply(`Equipped ${key}.`);
     }
-
-  } catch (err) {
-    console.error(err);
-    if (!interaction.replied) {
-      interaction.reply({ content: 'Error processing command.', ephemeral: true }).catch(() => {});
+    // /leaderboard
+    if (interaction.commandName === 'leaderboard') {
+      const rows = Object.entries(store.users).map(([id, u]) => ({ id, xp: u.xp })).sort((a, b) => b.xp - a.xp).slice(0, 10);
+      return interaction.reply(rows.map((r, i) => `${i + 1}. <@${r.id}> — ${r.xp} XP`).join('\n'));
     }
-  }
+  } catch (err) { console.error(err); }
 });
 
 client.login(token);
