@@ -1,4 +1,4 @@
-// FitRPG Bot — FINAL • Mongo + Keep-Alive + Mobile UX Edition
+// FitRPG Bot — FINAL • Mongo + Keep-Alive + Mobile UX Edition (+ WELCOME ANNOUNCEMENTS)
 // - Cloud persistence (MongoDB Atlas) — no Render Disk needed
 // - Keep-alive pinger (prevents Render free from sleeping)
 // - Reconnect hooks for Discord + Mongo
@@ -11,6 +11,7 @@
 // - Simple Raids
 // - Mobile-first shortcuts: /p /plank /runmiles + /quicklog + /logmenu (buttons + modal)
 // - QoL: /help /ping /leaderboard
+// - NEW: Welcome Announcements on member join (+ /setwelcome), optional auto-assign Novice
 // - Reliability: rate limit, error guards, daily de-dupe, atomic saves, graceful shutdown
 
 const {
@@ -93,7 +94,12 @@ async function mongoHydrateUser(id) {
 }
 
 /* ---------------- Client ---------------- */
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers // required for welcome joins
+  ]
+});
 
 /* Reconnect visibility */
 client.on('shardDisconnect', (event, id) => console.warn(`⚠️ Shard ${id} disconnected:`, event?.code));
@@ -125,10 +131,11 @@ let store = {
       { level: 1000, roleName: 'Transcendent' }
     ],
     levelUpChannelId: null,
+    dailyChannelId: null,
+    welcomeChannelId: null, // <— NEW
     logCooldownSec: 10,
     adventureCooldownSec: 15,
     raidHitCooldownSec: 8,
-    dailyChannelId: null,
     dailyPost: { hour: 0, minute: 1, tz:'America/Chicago' } // 00:01 CT
   }
 };
@@ -363,7 +370,7 @@ function randPick(a){ return a[Math.floor(Math.random()*a.length)]; }
 function rangePick(min,max,step=1){ const n = Math.floor((max-min)/step)+1; return min + step*Math.floor(Math.random()*n); }
 function generateDailyTheme() {
   const day = getNowInTZ(store.config.dailyPost.tz).getDay(); // 0..6
-  const order = ['mixed','upper','legs','core','run','upper','mixed'];
+  const order = ['mixed','upper','legs','core','run','upper','mixed']; // simple weekly feel
   return order[day];
 }
 function buildTasksForTheme(theme) {
@@ -499,6 +506,11 @@ const commands = [
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addIntegerOption(o=>o.setName('hour').setDescription('0–23').setRequired(true))
     .addIntegerOption(o=>o.setName('minute').setDescription('0–59').setRequired(true)),
+
+  // NEW: setwelcome channel
+  new SlashCommandBuilder().setName('setwelcome').setDescription('Set the welcome announcement channel')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addChannelOption(opt => opt.setName('channel').setDescription('Channel to post welcomes in').setRequired(true)),
 ];
 
 /* ---------------- Command Handling ---------------- */
@@ -534,7 +546,7 @@ client.on('interactionCreate', async interaction => {
             '• **Leaderboard**: `/leaderboard`',
             '• **Profile**: `/profile`',
             '',
-            'Admins: `/setdailychannel`, `/setlevelupchannel`, `/setdailytime hour minute`'
+            'Admins: `/setwelcome #channel`, `/setdailychannel`, `/setlevelupchannel`, `/setdailytime hour minute`'
           ].join('\n'))
           .setFooter({ text: 'Tip: use the shortcuts on your phone — no typing needed.' });
         return interaction.reply({ embeds:[emb], ephemeral:true });
@@ -726,7 +738,7 @@ client.on('interactionCreate', async interaction => {
           top = docs.map((d,i)=>`**${i+1}.** <@${d._id}> — ${d.xp||0} XP`);
         } else {
           const arr = Object.entries(store.users).map(([id,u])=>({id, xp:u.xp||0}));
-          arr.sort((a,b)=>b.xp-a.xp);
+          arr.sort((a,b)=>b.xp-a);
           top = arr.slice(0,10).map((d,i)=>`**${i+1}.** <@${d.id}> — ${d.xp} XP`);
         }
         if (!top.length) return interaction.reply('No data yet. Log a workout!');
@@ -751,6 +763,13 @@ client.on('interactionCreate', async interaction => {
         if(h<0||h>23||m<0||m>59) return interaction.reply({ content:'Use hour 0–23, minute 0–59.', ephemeral:true });
         store.config.dailyPost.hour=h; store.config.dailyPost.minute=m; saveSoon();
         return interaction.reply(`✅ Daily post time set to ${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')} America/Chicago`);
+      }
+      case 'setwelcome': {
+        if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({ content:'Admin only.', ephemeral:true });
+        const ch = interaction.options.getChannel('channel');
+        store.config.welcomeChannelId = ch.id;
+        saveSoon();
+        return interaction.reply(`✅ Welcome channel set to ${ch}.`);
       }
     }
   } catch(e){
@@ -906,6 +925,26 @@ async function onLevelUp(interaction, userObj, userData, oldLvl, newLvl){
     ch?.send({ embeds:[roleEmb] }).catch(()=>{});
   }
 }
+
+/* ---------------- NEW: Welcome announcements on member join ---------------- */
+client.on('guildMemberAdd', async member => {
+  const channelId = store.config.welcomeChannelId;
+  if (!channelId) return; // not configured
+  const ch = await client.channels.fetch(channelId).catch(()=>null);
+  if (!ch) return;
+
+  const emb = new EmbedBuilder()
+    .setTitle('🎉 NEW HERO JOINS THE PARTY! 🎉')
+    .setColor(0x00ff99)
+    .setDescription(`Welcome <@${member.id}> to **FitRPG**!\n\nYou begin as a **Novice**. Start logging with \`/logmenu\` and claim your destiny 💪🔥`)
+    .setThumbnail(member.user.displayAvatarURL());
+
+  ch.send({ embeds:[emb] }).catch(()=>{});
+
+  // Optional auto-assign Novice (if role exists and bot role is high enough)
+  const noviceRole = member.guild.roles.cache.find(r => r.name === 'Novice');
+  if (noviceRole) { member.roles.add(noviceRole).catch(()=>{}); }
+});
 
 /* ---------------- Ready / Register / Scheduler ---------------- */
 client.once('ready', async () => {
