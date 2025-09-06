@@ -1,7 +1,7 @@
-// FitRPG Bot — Mobile-first RPG Suite
-// QuickLog (buttons) • Shortcuts • Adventure • Raids (panel) • Shop/Gear/Trinkets
-// Level-up rewards & embeds • Daily quests & streaks • Simple event scheduler (+reminders)
-// Health server for Render (Web Service) • Level curve exponent 1.2
+// FitRPG Bot — Mobile-first RPG Suite (Stamina + Loot Focus)
+// QuickLog (buttons) • Shortcuts • Adventure (token-gated) • Raids (panel)
+// Shop/Gear/Trinkets/Consumables • Level-up Rewards & Embeds • Daily/Events
+// Rebalanced XP (running up), Level curve scaled to ~1000 levels (fast early, long tail)
 // Requires: discord.js ^14 (CommonJS)
 
 const {
@@ -21,7 +21,7 @@ http.createServer((_, res) => {
 
 /* ---------------- ENV ---------------- */
 const token    = process.env.DISCORD_TOKEN;
-const clientId = process.env.CLIENT_ID; // Application (Client) ID
+const clientId = process.env.CLIENT_ID; // App (Client) ID
 const guildId  = process.env.GUILD_ID;  // Server (Guild) ID
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
@@ -29,11 +29,11 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 /* ---------------- Persistent store ---------------- */
 const DATA_FILE = 'data.json';
 let store = {
-  users: {}, // id -> { xp, coins, inventory:[], equipped:{weapon:null,armor:null,trinket:null,cosmetic:null}, lastLog, lastAdventure, lastRaidHit, lastActiveISO, streak }
+  users: {}, // id -> { xp, coins, tokens, inventory:[], equipped:{weapon,armor,trinket,cosmetic}, lastLog, lastAdventure, lastRaidHit, lastActiveISO, streak, daily }
   customExercises: {},
   shop: { items: [] },
-  raids: { active: null }, // { id, bossName, tier, maxHp, hp, endsAt, messageId, channelId, contributions:{uid:dmg}, joined:[] }
-  events: [], // { id, title, at, channelId, remindMins:[...], createdBy }
+  raids: { active: null },
+  events: [],
   config: {
     levelRoles: [
       { level: 1,  roleName: 'Novice' },
@@ -46,44 +46,60 @@ let store = {
     logCooldownSec: 10,
     adventureCooldownSec: 15,
     raidHitCooldownSec: 8,
-    timezoneNote: 'America/Chicago' // for /help display only
+    timezoneNote: 'America/Chicago'
   }
 };
 if (fs.existsSync(DATA_FILE)) { try { store = { ...store, ...JSON.parse(fs.readFileSync(DATA_FILE,'utf8')) }; } catch {} }
 function save(){ fs.writeFileSync(DATA_FILE, JSON.stringify(store,null,2)); }
 
-/* ---------------- Exercises & XP ---------------- */
+function ensureUser(id){
+  if(!store.users[id]) store.users[id] = {
+    xp:0, coins:0, tokens:0,
+    inventory:[], equipped:{weapon:null,armor:null,trinket:null,cosmetic:null},
+    lastLog:0, lastAdventure:0, lastRaidHit:0, lastActiveISO:null, streak:0, daily:null
+  };
+  return store.users[id];
+}
+
+/* ---------------- Utility ---------------- */
+function norm(s){ return String(s||'').trim().toLowerCase().replace(/\s+/g,'_'); }
+function clamp(n,lo,hi){ return Math.max(lo, Math.min(hi, Number.isFinite(n)?n:0)); }
+function R(min,max){ return Math.floor(Math.random()*(max-min+1))+min; }
+function toLbs(weight, unit){ if(!weight||weight<=0) return 0; if(!unit||unit==='lb'||unit==='lbs') return weight; if(unit==='kg') return weight*2.2046226218; return weight; }
+function todayISO(){ return new Date().toISOString().slice(0,10); }
+function fmtTime(ts){ const d=new Date(ts); return d.toLocaleString('en-US'); }
+
+/* ---------------- XP model (rebalanced) ---------------- */
+// You asked for higher XP than my first draft, but still balanced.
+// - Running: 35 XP per mile
+// - Pushups: 0.45 XP / rep
+// - Plank: 0.16 XP / sec (9.6/min)
+// - Weighted: reps * weight(lb) * 0.03 XP
+// - Others tuned proportionally
+
 const BUILT_INS = {
   // bodyweight
-  pushups:{ unit:'reps', rate:0.5 }, situps:{ unit:'reps', rate:0.5 }, squats:{ unit:'reps', rate:0.5 },
-  lunges:{ unit:'reps', rate:0.6 }, burpees:{ unit:'reps', rate:1.0 }, pullups:{ unit:'reps', rate:1.5 }, dips:{ unit:'reps', rate:1.5 },
+  pushups:{ unit:'reps', rate:0.45 }, situps:{ unit:'reps', rate:0.35 }, squats:{ unit:'reps', rate:0.35 },
+  lunges:{ unit:'reps', rate:0.40 }, burpees:{ unit:'reps', rate:1.10 }, pullups:{ unit:'reps', rate:1.8 }, dips:{ unit:'reps', rate:1.6 },
   // time
-  plank:{ unit:'seconds', rate:0.2 },
+  plank:{ unit:'seconds', rate:0.16 },
   // cardio
-  run_miles:{ unit:'miles', rate:20 }, run:{ unit:'minutes', rate:0.17 }, cycle_miles:{ unit:'miles', rate:8 },
-  row_minutes:{ unit:'minutes', rate:0.25 }, swim_laps:{ unit:'laps', rate:15 },
-  // weighted
-  bench:{ unit:'weighted_reps', rateWeight:0.02 }, legpress:{ unit:'weighted_reps', rateWeight:0.02 },
-  deadlift:{ unit:'weighted_reps', rateWeight:0.02 }, squat_barbell:{ unit:'weighted_reps', rateWeight:0.02 }, ohp:{ unit:'weighted_reps', rateWeight:0.02 },
-  // sessions
-  strengthsession:{ unit:'sessions', rate:25 }
+  run_miles:{ unit:'miles', rate:35 }, run:{ unit:'minutes', rate:0.30 }, cycle_miles:{ unit:'miles', rate:12 },
+  row_minutes:{ unit:'minutes', rate:0.40 }, swim_laps:{ unit:'laps', rate:18 },
+  // weighted (volume)
+  bench:{ unit:'weighted_reps', rateWeight:0.03 }, legpress:{ unit:'weighted_reps', rateWeight:0.03 },
+  deadlift:{ unit:'weighted_reps', rateWeight:0.035 }, squat_barbell:{ unit:'weighted_reps', rateWeight:0.035 }, ohp:{ unit:'weighted_reps', rateWeight:0.03 },
+  // session
+  strengthsession:{ unit:'sessions', rate:35 }
 };
-const UNIT_DEFAULTS = { reps:0.5, seconds:0.2, minutes:0.2, miles:12, km:7.5, meters:0.012, laps:10, sessions:25 };
-const MOBILE_EXERCISE_CHOICES = [
-  { label:'Pushups', value:'pushups' }, { label:'Situps', value:'situps' }, { label:'Squats', value:'squats' },
-  { label:'Plank (sec)', value:'plank' }, { label:'Pullups', value:'pullups' },
-  { label:'Run (miles)', value:'run_miles' }, { label:'Bench (weighted)', value:'bench' }
-];
-
-function norm(s){ return String(s||'').trim().toLowerCase().replace(/\s+/g,'_'); }
-function toLbs(weight, unit){ if(!weight||weight<=0) return 0; if(!unit||unit==='lb'||unit==='lbs') return weight; if(unit==='kg') return weight*2.2046226218; return weight; }
+const UNIT_DEFAULTS = { reps:0.35, seconds:0.14, minutes:0.28, miles:25, km:15, meters:0.015, laps:12, sessions:30 };
 
 function computeXP({ exercise, amount, unit, weight, weightUnit }) {
   const key = norm(exercise);
   const cfg = BUILT_INS[key] || store.customExercises[key];
   if (cfg && cfg.unit === 'weighted_reps') {
     const reps = amount; const lbs = toLbs(weight||0, weightUnit);
-    const xp = (cfg.rateWeight||0.02) * (lbs * reps);
+    const xp = (cfg.rateWeight||0.03) * (lbs * reps);
     return { xp, basis:`weighted: ${reps} reps @ ${lbs.toFixed(1)} lb` };
   }
   const useUnit = unit || (cfg ? cfg.unit : null);
@@ -92,83 +108,36 @@ function computeXP({ exercise, amount, unit, weight, weightUnit }) {
   return { xp, basis:`${amount} ${useUnit || (cfg ? cfg.unit : 'units')}` };
 }
 
-/* ---------------- Levels, multipliers, streaks & roles ---------------- */
-// Softer curve for mobile: base 90, exponent 1.2
+/* ---------------- Level curve (~1000 levels, fast early) ---------------- */
+// Softcaps: 1–50 (fast), 51–200 (moderate), 200+ (long tail).
+function xpToNextLevel(n){ // n = current level
+  if (n < 50)  return Math.floor(60 * Math.pow(n+1, 1.05));   // quick early gains
+  if (n < 200) return Math.floor(80 * Math.pow(n+1, 1.08));   // moderate midgame
+  return Math.floor(100 * Math.pow(n+1, 1.12));               // long tail
+}
 function levelFromXp(xp){
-  xp = Number(xp||0); let lvl=0, rem=xp;
-  while(true){ const need=Math.floor(90*Math.pow(lvl+1,1.2)); if(rem>=need){ rem-=need; lvl++; } else break; }
+  xp = Math.max(0, Math.floor(xp||0));
+  let lvl = 0, rem = xp;
+  while(true){
+    const need = xpToNextLevel(lvl);
+    if (rem >= need){ rem -= need; lvl++; if (lvl>1200) break; } else break;
+  }
   return lvl;
 }
-function levelXpMultiplier(l){ if(l>=40) return 1.18; if(l>=25) return 1.12; if(l>=10) return 1.06; return 1.00; }
-function levelCoinMultiplier(l){ if(l>=40) return 1.25; if(l>=25) return 1.15; if(l>=10) return 1.08; return 1.00; }
+function levelXpMultiplier(l){ if(l>=400) return 1.20; if(l>=200) return 1.14; if(l>=100) return 1.10; if(l>=40) return 1.06; return 1.00; }
+function levelCoinMultiplier(l){ if(l>=400) return 1.30; if(l>=200) return 1.20; if(l>=100) return 1.12; if(l>=40) return 1.08; return 1.00; }
+
 async function grantLevelRoles(guild, member, prev, now){
-  for (const th of store.config.levelRoles) {
+  for (const th of store.config.levelRoles)
     if (prev < th.level && now >= th.level) {
       const role = guild.roles.cache.find(r => r.name === th.roleName);
-      if (role) { try { await member.roles.add(role.id,'Level-up'); } catch(e){ console.warn('Role add:', e.message); } }
+      if (role) { try { await member.roles.add(role.id,'Level-up'); } catch{} }
     }
-  }
-}
-function ensureUser(id){
-  if(!store.users[id]) store.users[id] = {
-    xp:0, coins:0, inventory:[], equipped:{weapon:null,armor:null,trinket:null,cosmetic:null},
-    lastLog:0, lastAdventure:0, lastRaidHit:0, lastActiveISO:null, streak:0, daily:null
-  };
-  return store.users[id];
-}
-function touchStreak(user){
-  const today = new Date(); const dISO = today.toISOString().slice(0,10);
-  if (user.lastActiveISO === dISO) return; // already counted today
-  if (!user.lastActiveISO) { user.streak = 1; user.lastActiveISO = dISO; return; }
-  const prev = new Date(user.lastActiveISO+'T00:00:00Z'); const diffDays = Math.round((today - prev)/86400000);
-  if (diffDays === 1) user.streak += 1;
-  else if (diffDays > 1) user.streak = 1;
-  user.lastActiveISO = dISO;
 }
 
-/* ---------------- Shop inventory (expanded) ---------------- */
-if(!store.shop.items || store.shop.items.length===0){
-  store.shop.items = [
-    // Weapons
-    { key:'wooden_sword',  name:'Wooden Sword',  type:'weapon', power:2,  price:50,  desc:'Starter blade.' },
-    { key:'iron_sword',    name:'Iron Sword',    type:'weapon', power:5,  price:150, desc:'Reliable steel.', levelReq:3 },
-    { key:'war_hammer',    name:'War Hammer',    type:'weapon', power:9,  price:400, desc:'Bonk with style.', levelReq:7,  critChance:+0.03, critDamage:+0.25 },
-    { key:'storm_blade',   name:'Storm Blade',   type:'weapon', power:12, price:650, desc:'Crackling edge.',  levelReq:10, critChance:+0.05, critDamage:+0.35 },
-    { key:'dragon_lance',  name:'Dragon Lance',  type:'weapon', power:16, price:950, desc:'Legend-tier.',     levelReq:14, critChance:+0.06, critDamage:+0.45 },
-    // Armor
-    { key:'leather_armor', name:'Leather Armor', type:'armor',  power:2,  price:120, desc:'Light defense.' },
-    { key:'chainmail',     name:'Chainmail',     type:'armor',  power:4,  price:260, desc:'Solid protection.', levelReq:4,  block:+0.03 },
-    { key:'plate_armor',   name:'Plate Armor',   type:'armor',  power:7,  price:600, desc:'Heavy duty.',       levelReq:10, block:+0.06 },
-    { key:'aegis_mail',    name:'Aegis Mail',    type:'armor',  power:10, price:900, desc:'Guardian steel.',   levelReq:14, block:+0.08 },
-    // Trinkets
-    { key:'runner_band',   name:'Runner’s Band',   type:'trinket', price:180, desc:'You feel swift.',  xpMult:+0.05 },
-    { key:'merchant_coin', name:'Merchant’s Coin', type:'trinket', price:240, desc:'Coins find you.',  coinMult:+0.10 },
-    { key:'lucky_charm',   name:'Lucky Charm',     type:'trinket', price:320, desc:'A little luck.',  critChance:+0.04 },
-    // Cosmetics/Titles
-    { key:'color_royal',   name:'Royal Color',   type:'cosmetic', price:120, desc:'Royal flair.', roleReward:'Royal' },
-    { key:'title_champion',name:'Title: Champion', type:'cosmetic', price:300, desc:'Show your title.', roleReward:'Title: Champion' }
-  ];
-  save();
-}
-
-/* ---------------- Monsters & raids ---------------- */
-const MONSTERS = [
-  { key:'slime',  name:'Training Slime',  tier:1, hp:[20,30],  atk:[2,4],   coin:[12,22],  xp:[20,35]  },
-  { key:'boar',   name:'Wild Boar',       tier:2, hp:[35,55],  atk:[4,7],   coin:[22,35],  xp:[35,55]  },
-  { key:'bandit', name:'Roadside Bandit', tier:3, hp:[55,80],  atk:[6,10],  coin:[35,55],  xp:[55,85]  },
-  { key:'golem',  name:'Stone Golem',     tier:4, hp:[85,120], atk:[8,14],  coin:[55,90],  xp:[85,130] },
-  { key:'wyvern', name:'Cliff Wyvern',    tier:5, hp:[125,170],atk:[12,18], coin:[90,150], xp:[130,200] }
-];
-function R(min,max){ return Math.floor(Math.random()*(max-min+1))+min; }
-function pickMonster(level){
-  const idx=Math.min(MONSTERS.length-1, Math.floor(level/7));
-  const pool=MONSTERS.slice(Math.max(0,idx-1), idx+1);
-  const base=pool[R(0,pool.length-1)];
-  return { ...base, hp:R(base.hp[0],base.hp[1]), atk:R(base.atk[0],base.atk[1]), coin:R(base.coin[0],base.coin[1]), xp:R(base.xp[0],base.xp[1]) };
-}
-
-/* ---------------- Gear power & bonuses ---------------- */
+/* ---------------- Gear & shop (expanded) ---------------- */
 function getItem(key){ return store.shop.items.find(i => i.key===key); }
+function basePower(level){ return 1 + Math.floor(level/4); }
 function gearBonuses(user){
   const w = user.equipped?.weapon ? getItem(user.equipped.weapon) : null;
   const a = user.equipped?.armor  ? getItem(user.equipped.armor)  : null;
@@ -182,53 +151,111 @@ function gearBonuses(user){
   const coinMult   = 1 + (t?.coinMult||0);
   return { weaponPow, armorPow, critChance, critDamage, block, xpMult, coinMult, totalPow: weaponPow+armorPow };
 }
-function basePower(level){ return 1 + Math.floor(level/4); }
-function clamp(n,lo,hi){ return Math.max(lo, Math.min(hi, Number.isFinite(n)?n:0)); }
 
-/* ---------------- Daily quests ---------------- */
-function todayISO(){ return new Date().toISOString().slice(0,10); }
-function ensureDaily(user){
-  if (user.daily && user.daily.date === todayISO()) return user.daily;
-  // generate 3 tasks from a lightweight pool tuned for phones
-  const tasks = [];
-  const pick = (arr)=>arr[R(0,arr.length-1)];
-  const t1 = { type:'pushups', desc:'Do pushups', unit:'reps', target: pick([20,40,60,100]), progress:0, rewardXp: pick([50,70]), rewardCoins: pick([30,50]) };
-  const t2 = { type:'plank',   desc:'Hold plank (sec)', unit:'seconds', target: pick([60,120,180]), progress:0, rewardXp: pick([60,80]), rewardCoins: pick([35,55]) };
-  const t3 = { type:'run_miles',desc:'Run (miles)', unit:'miles', target: pick([1,2,3]), progress:0, rewardXp: pick([80,120]), rewardCoins: pick([50,80]) };
-  tasks.push(t1,t2,t3);
-  user.daily = { date: todayISO(), tasks, claimed: false };
-  return user.daily;
-}
-function applyDailyProgress(user, exercise, amount, unit){
-  const d = ensureDaily(user);
-  for (const t of d.tasks) {
-    if (t.type === exercise && (t.unit === unit || !unit)) {
-      t.progress = Math.min(t.target, (t.progress||0) + amount);
-    }
-  }
-  // special: generic contributions
-  if (exercise==='pushups' && unit==='reps'){
-    const plankTask = d.tasks.find(x=>x.type==='plank');
-    if (plankTask && plankTask.progress < plankTask.target && amount>=50) plankTask.progress += 10; // tiny synergy bonus
-  }
-}
-function dailyEmbed(user){
-  const d=ensureDaily(user);
-  const lines = d.tasks.map((t,i)=>{
-    const pct = Math.min(100, Math.floor((t.progress/t.target)*100));
-    return `${i+1}. **${t.desc}** — ${t.progress}/${t.target} ${t.unit} 〔${pct}%〕  → Reward: +${t.rewardXp} XP, +${t.rewardCoins} coins`;
-  });
-  return new EmbedBuilder().setTitle(`📅 Daily Quests — ${d.date}`).setColor(0x00C2FF)
-    .setDescription(lines.join('\n') + `\n\nUse **/daily claim** when all three are complete for a chest bonus.`);
+if(!store.shop.items || store.shop.items.length<10){
+  store.shop.items = [
+    // T1 weapons
+    { key:'stick',          name:'Training Stick',  type:'weapon', power:1,  price:20,  desc:'Barely a weapon.' },
+    { key:'wooden_sword',   name:'Wooden Sword',    type:'weapon', power:2,  price:60,  desc:'Starter blade.' },
+    // T2 weapons
+    { key:'iron_sword',     name:'Iron Sword',      type:'weapon', power:5,  price:180, levelReq:3,  desc:'Reliable steel.' },
+    { key:'spear',          name:'Spear',           type:'weapon', power:6,  price:220, levelReq:4,  desc:'Reach advantage.' },
+    { key:'hunting_bow',    name:'Hunting Bow',     type:'weapon', power:6,  price:240, levelReq:4,  desc:'Silent and steady.' },
+    // T3 weapons
+    { key:'steel_axe',      name:'Steel Axe',       type:'weapon', power:9,  price:420, levelReq:7,  desc:'Hefty chop.', critChance:+0.02 },
+    { key:'war_hammer',     name:'War Hammer',      type:'weapon', power:10, price:480, levelReq:8,  desc:'Bonk with style.', critChance:+0.03, critDamage:+0.20 },
+    { key:'longbow',        name:'Longbow',         type:'weapon', power:11, price:520, levelReq:8,  desc:'Piercing shots.', critChance:+0.03 },
+    // T4 weapons
+    { key:'runed_blade',    name:'Runed Blade',     type:'weapon', power:14, price:800, levelReq:12, desc:'Arcane edge.', critChance:+0.04, critDamage:+0.25 },
+    { key:'flamebrand',     name:'Flamebrand',      type:'weapon', power:16, price:980, levelReq:14, desc:'Burning strikes.', critChance:+0.04 },
+    { key:'storm_spear',    name:'Storm Spear',     type:'weapon', power:17, price:1100,levelReq:16, desc:'Crackling reach.', critChance:+0.05 },
+    // T5 weapons (rare)
+    { key:'dragon_slayer',  name:'Dragon Slayer',   type:'weapon', power:22, price:1600,levelReq:20, desc:'Legend-tier.', critChance:+0.06, critDamage:+0.35 },
+
+    // Armor T1–T5
+    { key:'cloth_tunic',    name:'Cloth Tunic',     type:'armor',  power:1,  price:40,  desc:'Better than nothing.' },
+    { key:'padded_vest',    name:'Padded Vest',     type:'armor',  power:2,  price:90,  desc:'Light padding.' },
+    { key:'leather_armor',  name:'Leather Armor',   type:'armor',  power:3,  price:160, desc:'Flexible defense.' },
+    { key:'chainmail',      name:'Chainmail',       type:'armor',  power:5,  price:300, levelReq:4,  desc:'Solid links.', block:+0.02 },
+    { key:'scale_armor',    name:'Scale Armor',     type:'armor',  power:7,  price:520, levelReq:8,  desc:'Layered plates.', block:+0.03 },
+    { key:'half_plate',     name:'Half-Plate',      type:'armor',  power:9,  price:700, levelReq:10, desc:'Hefty guard.', block:+0.04 },
+    { key:'full_plate',     name:'Full Plate',      type:'armor',  power:11, price:900, levelReq:12, desc:'Knightly bulk.', block:+0.05 },
+    { key:'dragonhide',     name:'Dragonhide',      type:'armor',  power:13, price:1200,levelReq:16, desc:'Scales of legend.', block:+0.06 },
+    { key:'celestial_plate',name:'Celestial Plate', type:'armor',  power:16, price:1600,levelReq:20, desc:'Otherworldly.', block:+0.08 },
+
+    // Trinkets (ultra-rare to drop, pricey in shop)
+    { key:'runner_band',    name:'Runner’s Band',   type:'trinket', price:600, levelReq:8,  desc:'Run farther.', xpMult:+0.04 },
+    { key:'merchant_coin',  name:'Merchant’s Coin', type:'trinket', price:800, levelReq:10, desc:'Coins find you.', coinMult:+0.10 },
+    { key:'lucky_charm',    name:'Lucky Charm',     type:'trinket', price:1000,levelReq:12, desc:'A little luck.', critChance:+0.04 },
+
+    // Consumables (common)
+    { key:'health_potion',  name:'Health Potion',   type:'consumable', price:60,  desc:'+1 extra raid attack (one time).' },
+    { key:'energy_drink',   name:'Energy Drink',    type:'consumable', price:120, desc:'Double XP on your next workout log.' },
+    { key:'treasure_map',   name:'Treasure Map',    type:'consumable', price:240, desc:'Next adventure guarantees a loot roll.' },
+
+    // Cosmetics / Titles
+    { key:'color_royal',    name:'Royal Color',     type:'cosmetic', price:140, desc:'Royal flair.', roleReward:'Royal' },
+    { key:'title_champion', name:'Title: Champion', type:'cosmetic', price:360, desc:'Pro claim.',   roleReward:'Title: Champion' }
+  ];
+  save();
 }
 
-/* ---------------- Events (simple scheduler) ---------------- */
-function fmtTime(ts){ const d=new Date(ts); return d.toLocaleString('en-US'); }
+/* ---------------- Monsters & encounters ---------------- */
+const MONSTERS = [
+  { key:'slime',  name:'Training Slime',  tier:1, hp:[22,32],  atk:[2,4]  },
+  { key:'boar',   name:'Wild Boar',       tier:2, hp:[40,60],  atk:[4,7]  },
+  { key:'bandit', name:'Roadside Bandit', tier:3, hp:[60,85],  atk:[6,10] },
+  { key:'golem',  name:'Stone Golem',     tier:4, hp:[90,125], atk:[8,14] },
+  { key:'wyvern', name:'Cliff Wyvern',    tier:5, hp:[130,175],atk:[12,18]}
+];
+function pickMonster(level){
+  const idx=Math.min(MONSTERS.length-1, Math.floor(level/7));
+  const pool=MONSTERS.slice(Math.max(0,idx-1), idx+1);
+  const base=pool[R(0,pool.length-1)];
+  return { ...base, hp:R(base.hp[0],base.hp[1]), atk:R(base.atk[0],base.atk[1]) };
+}
+
+/* ---------------- Loot tables (adventure) ---------------- */
+// Adventure: loot-first. XP/coins small. Trinkets ultra-rare.
+const LOOT_TABLE = [
+  // [type, weight, picker]
+  { type:'consumable', weight:55, pick:() => R(0,100)<60 ? 'health_potion' : (R(0,100)<50 ? 'energy_drink' : 'treasure_map') },
+  { type:'weapon_or_armor', weight:35, pick:() => {
+      const pool = store.shop.items.filter(i => (i.type==='weapon'||i.type==='armor') && (!i.levelReq || i.levelReq<=80));
+      return pool.length? pool[R(0,pool.length-1)].key : null;
+  }},
+  { type:'trinket', weight:8, pick:() => {
+      const pool = store.shop.items.filter(i => i.type==='trinket');
+      if (!pool.length) return null;
+      // ultra-rare gate
+      return Math.random() < 0.12 ? pool[R(0,pool.length-1)].key : null; // 12% of trinket roll, but table weight is only 8
+  }},
+  { type:'cosmetic', weight:2, pick:() => (Math.random()<0.5?'color_royal':'title_champion') }
+];
+const LOOT_TOTAL_WEIGHT = LOOT_TABLE.reduce((a,b)=>a+b.weight,0);
+function rollLoot(){
+  let roll = Math.random() * LOOT_TOTAL_WEIGHT;
+  for (const entry of LOOT_TABLE){
+    if ((roll -= entry.weight) <= 0) return entry.pick();
+  }
+  return null;
+}
+
+/* ---------------- Streaks & dailies (existing) ---------------- */
+function touchStreak(user){
+  const today = new Date(); const dISO = today.toISOString().slice(0,10);
+  if (user.lastActiveISO === dISO) return;
+  if (!user.lastActiveISO) { user.streak = 1; user.lastActiveISO = dISO; return; }
+  const prev = new Date(user.lastActiveISO+'T00:00:00Z'); const diffDays = Math.round((today - prev)/86400000);
+  if (diffDays === 1) user.streak += 1;
+  else if (diffDays > 1) user.streak = 1;
+  user.lastActiveISO = dISO;
+}
 
 /* ---------------- Slash commands ---------------- */
 const commands = [
-  // Help
   new SlashCommandBuilder().setName('help').setDescription('Show all commands & tips'),
+  new SlashCommandBuilder().setName('profile').setDescription('Show your level, XP, coins, and tokens'),
 
   // Mobile quick logging
   new SlashCommandBuilder().setName('quicklog').setDescription('Tap-to-log workout (mobile-friendly buttons)'),
@@ -243,7 +270,7 @@ const commands = [
     .addStringOption(o=>o.setName('weight_unit').setDescription('lb or kg').addChoices({name:'lb',value:'lb'},{name:'kg',value:'kg'}).setRequired(true)),
 
   // General logger
-  new SlashCommandBuilder().setName('log').setDescription('Log any workout for XP/coins')
+  new SlashCommandBuilder().setName('log').setDescription('Log any workout for XP/coins/tokens')
     .addStringOption(o=>o.setName('exercise').setDescription('e.g., pushups, run_miles, bench').setRequired(true))
     .addNumberOption(o=>o.setName('amount').setDescription('Reps / seconds / minutes / miles / etc.').setRequired(true))
     .addStringOption(o=>o.setName('unit').setDescription('Unit (reps, seconds, minutes, miles, km, meters, laps, sessions, weighted_reps)')
@@ -263,18 +290,19 @@ const commands = [
   new SlashCommandBuilder().setName('buy').setDescription('Buy an item').addStringOption(o=>o.setName('item_key').setDescription('key from /shop').setRequired(true)),
   new SlashCommandBuilder().setName('inventory').setDescription('Your items'),
   new SlashCommandBuilder().setName('equip').setDescription('Equip a weapon/armor/trinket/cosmetic by key').addStringOption(o=>o.setName('item_key').setDescription('from inventory').setRequired(true)),
+  new SlashCommandBuilder().setName('use').setDescription('Use a consumable from your inventory').addStringOption(o=>o.setName('item_key').setDescription('health_potion, energy_drink, treasure_map...').setRequired(true)),
 
   // Encounters & raids
-  new SlashCommandBuilder().setName('adventure').setDescription('Quick fight vs a random monster'),
+  new SlashCommandBuilder().setName('adventure').setDescription('Fight a random monster (consumes 1 adventure token)'),
 
   new SlashCommandBuilder().setName('raidstart').setDescription('Admin: start a raid boss (tier 1-5)')
-    .addIntegerOption(o=>o.setName('tier').setDescription('1 (easy) to 5 (hard)').setRequired(true))
+    .addIntegerOption(o=>o.setName('tier').setDescription('1–5').setRequired(true))
     .addIntegerOption(o=>o.setName('duration_min').setDescription('duration in minutes').setRequired(true))
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName('raidstatus').setDescription('Show the current raid status'),
   new SlashCommandBuilder().setName('raidend').setDescription('Admin: end the current raid now').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
-  // Dailies & streaks
+  // Dailies & streaks (from previous build)
   new SlashCommandBuilder().setName('daily').setDescription('Your daily quests (claim when complete)')
     .addSubcommand(s=>s.setName('show').setDescription('Show today’s quests'))
     .addSubcommand(s=>s.setName('claim').setDescription('Claim rewards if all tasks are complete')),
@@ -300,8 +328,53 @@ const rest = new REST({ version:'10' }).setToken(token);
 async function registerCommands(){ await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: commands }); console.log('✅ Commands registered'); }
 client.once('ready', () => { console.log(`🤖 Logged in as ${client.user.tag}`); registerCommands().catch(console.error); startEventTicker(); });
 
-/* ---------------- Components: QuickLog & Raids ---------------- */
-const quickState = new Map(); // messageId -> { userId, exercise, amount, unit }
+/* ---------------- Help / Profile embeds ---------------- */
+function helpEmbed() {
+  return new EmbedBuilder()
+    .setTitle('📘 FitRPG — Commands')
+    .setColor(0x00c2ff)
+    .setDescription(`Phone-first logging, RPG raids, loot-first adventures.\nAdventure uses **tokens** earned by working out.\nTimezone: ${store.config.timezoneNote}`)
+    .addFields(
+      { name:'Quick Logging (mobile)', value:
+        '`/quicklog` → dropdown + +1/+5/+10/+30/+60 → Submit\n' +
+        '`/p amount:<reps>` (pushups) • `/plank seconds:<sec>` • `/runmiles miles:<mi>` • `/bench reps:<r> weight:<w> weight_unit:<lb|kg>`'
+      },
+      { name:'General Logger', value:
+        '`/log exercise:<name> amount:<n> unit:<unit> [weight] [weight_unit]`\n' +
+        'Built-ins: pushups, situps, squats, plank, pullups, run_miles, bench, deadlift, squat_barbell, ohp, legpress …\n' +
+        'Logging grants **XP/coins** and **adventure tokens**.'
+      },
+      { name:'RPG & Progress', value:
+        '`/profile`, `/stats`, `/gear`, `/coins`, `/shop`, `/buy`, `/inventory`, `/equip`, `/use`\n' +
+        '`/adventure` (consumes 1 token; loot-first, small XP/coins)\n' +
+        '`/raidstart`, `/raidstatus`, `/raidend`'
+      },
+      { name:'Daily & Streak', value:
+        '`/daily show` • `/daily claim`\n' +
+        '`/streak`'
+      },
+      { name:'Events', value:
+        '`/eventcreate title:<t> minutes_from_now:<m> [reminders:30,10,5]` • `/eventlist` • `/eventcancel id:<id>`'
+      },
+      { name:'Admin Setup', value:
+        '`/setlevelupchannel channel:#level-ups`\n' +
+        'Create roles: Novice/Apprentice/Warrior/Champion/Legend and place bot’s role above them.'
+      }
+    );
+}
+function profileEmbed(user, username){
+  const lvl = levelFromXp(user.xp);
+  return new EmbedBuilder().setTitle(`${username} — Profile`).setColor(0x00c2ff)
+    .addFields(
+      { name:'Level', value:`**${lvl}** (${user.xp.toFixed(1)} XP)`, inline:true },
+      { name:'Coins', value:`${user.coins}`, inline:true },
+      { name:'Tokens', value:`${user.tokens}`, inline:true },
+      { name:'Streak', value:`${user.streak} days`, inline:true }
+    );
+}
+
+/* ---------------- UI helpers ---------------- */
+const quickState = new Map(); // msgId -> { userId, exercise, amount, unit }
 function panelText(s){
   const ex = s.exercise ? `**${s.exercise}**` : 'none';
   const amt = s.amount||0;
@@ -327,47 +400,9 @@ function raidButtons(){
   ) ];
 }
 
-/* ---------------- Help embed ---------------- */
-function helpEmbed() {
-  return new EmbedBuilder()
-    .setTitle('📘 FitRPG — Commands')
-    .setColor(0x00c2ff)
-    .setDescription(`Phone-first logging, RPG battles, raids, shop, dailies & events.\nTimezone note: ${store.config.timezoneNote}`)
-    .addFields(
-      { name: 'Quick Logging (mobile)', value:
-        '`/quicklog` → dropdown + +1/+5/+10/+30/+60 → Submit\n' +
-        '`/p amount:<reps>`  (pushups)\n' +
-        '`/plank seconds:<sec>`\n' +
-        '`/runmiles miles:<mi>`\n' +
-        '`/bench reps:<r> weight:<w> weight_unit:<lb|kg>`'
-      },
-      { name: 'General Logger', value:
-        '`/log exercise:<name> amount:<n> unit:<unit> [weight] [weight_unit]`\n' +
-        'Built-ins: pushups, situps, squats, plank, pullups, run_miles, bench, deadlift, squat_barbell, ohp, legpress …'
-      },
-      { name: 'RPG & Progress', value:
-        '`/stats`, `/gear`, `/coins`, `/shop`, `/buy`, `/inventory`, `/equip`\n' +
-        '`/adventure` (quick fight)\n' +
-        '`/raidstart`, `/raidstatus`, `/raidend`'
-      },
-      { name: 'Daily & Streak', value:
-        '`/daily show`  |  `/daily claim` (after all 3 tasks complete)\n' +
-        '`/streak` (bonus at milestones)'
-      },
-      { name: 'Events (simple reminders)', value:
-        '`/eventcreate title:<text> minutes_from_now:<min> [reminders:30,10,5]`\n' +
-        '`/eventlist`  |  `/eventcancel id:<id>`'
-      },
-      { name: 'Admin Setup', value:
-        '`/setlevelupchannel channel:#level-ups`\n' +
-        'Create roles: Novice/Apprentice/Warrior/Champion/Legend and place bot’s role above them.'
-      }
-    );
-}
-
-/* ---------------- Interaction handling ---------------- */
+/* ---------------- Interactions ---------------- */
 client.on('interactionCreate', async (interaction) => {
-  // Component interactions (buttons/selects) for mobile quicklog & raids
+  // Component interactions
   if (interaction.isButton() || interaction.isStringSelectMenu()) {
     try {
       if (interaction.customId.startsWith('ql:')) return handleQuickLogComponent(interaction);
@@ -375,17 +410,15 @@ client.on('interactionCreate', async (interaction) => {
     } catch(e){ console.error(e); }
     return;
   }
-
   if (!interaction.isChatInputCommand()) return;
+
   const uid = interaction.user.id;
   const me = ensureUser(uid);
 
   try {
     if (interaction.commandName === 'ping') return interaction.reply('Pong! ✅');
-
-    if (interaction.commandName === 'help') {
-      return interaction.reply({ embeds:[helpEmbed()], ephemeral:true });
-    }
+    if (interaction.commandName === 'help') return interaction.reply({ embeds:[helpEmbed()], ephemeral:true });
+    if (interaction.commandName === 'profile') return interaction.reply({ embeds:[profileEmbed(me, interaction.user.username)] });
 
     if (interaction.commandName === 'setlevelupchannel') {
       const ch = interaction.options.getChannel('channel', true);
@@ -393,10 +426,14 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.reply(`Level-up announcements will go to <#${ch.id}>.`);
     }
 
-    /* ---------- QUICK MOBILE LOGGING ---------- */
+    /* ---------- QUICKLOG ---------- */
     if (interaction.commandName === 'quicklog') {
       const row1 = new ActionRowBuilder().addComponents(
-        new StringSelectMenuBuilder().setCustomId('ql:select').setPlaceholder('Choose workout').addOptions(MOBILE_EXERCISE_CHOICES)
+        new StringSelectMenuBuilder().setCustomId('ql:select').setPlaceholder('Choose workout').addOptions(
+          { label:'Pushups', value:'pushups' }, { label:'Situps', value:'situps' }, { label:'Squats', value:'squats' },
+          { label:'Plank (sec)', value:'plank' }, { label:'Pullups', value:'pullups' },
+          { label:'Run (miles)', value:'run_miles' }, { label:'Bench (weighted)', value:'bench' }
+        )
       );
       const row2 = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('ql:+1').setLabel('+1').setStyle(ButtonStyle.Secondary),
@@ -447,12 +484,7 @@ client.on('interactionCreate', async (interaction) => {
         `• **${it.name}** \`${it.key}\` — ${it.price} coins` +
         ((it.type==='weapon'||it.type==='armor')?` (power ${it.power})`:'') +
         (it.levelReq?` 〔req: L${it.levelReq}〕`:``) +
-        (it.desc?` — ${it.desc}`:``) +
-        (it.xpMult?` 〔+${Math.round(it.xpMult*100)}% XP〕`:``) +
-        (it.coinMult?` 〔+${Math.round(it.coinMult*100)}% coins〕`:``) +
-        (it.critChance?` 〔+${Math.round(it.critChance*100)}% crit〕`:``) +
-        (it.block?` 〔+${Math.round(it.block*100)}% block〕`:``) +
-        (it.roleReward?` 〔Grants role: ${it.roleReward}〕`:``)
+        (it.desc?` — ${it.desc}`:``)
       );
       return interaction.reply(lines.length? `🛒 **Shop** (you are L${lvl})\n${lines.join('\n')}` : 'Shop is empty.');
     }
@@ -463,8 +495,8 @@ client.on('interactionCreate', async (interaction) => {
       if (it.levelReq && lvl < it.levelReq) return interaction.reply({ content:`Requires level ${it.levelReq}. You are level ${lvl}.`, ephemeral:true });
       if (me.coins < it.price) return interaction.reply({ content:`Not enough coins. Need ${it.price}.`, ephemeral:true });
       me.coins -= it.price; me.inventory.push(it.key); save();
-      if(it.roleReward){ try{ const guild=await client.guilds.fetch(guildId); const role=guild.roles.cache.find(r=>r.name===it.roleReward); if(role){ const member=await guild.members.fetch(uid); await member.roles.add(role.id,'Shop reward'); } }catch(e){ console.warn('Role reward', e.message); } }
-      return interaction.reply(`Purchased **${it.name}** for **${it.price}** coins! Use /inventory and /equip.`);
+      if(it.roleReward){ try{ const guild=await client.guilds.fetch(guildId); const role=guild.roles.cache.find(r=>r.name===it.roleReward); if(role){ const member=await guild.members.fetch(uid); await member.roles.add(role.id,'Shop reward'); } }catch{} }
+      return interaction.reply(`Purchased **${it.name}** for **${it.price}** coins! Use /inventory and /equip or /use.`);
     }
     if (interaction.commandName === 'inventory') {
       if(!me.inventory.length) return interaction.reply('🎒 Inventory empty. Buy something in /shop!');
@@ -482,12 +514,29 @@ client.on('interactionCreate', async (interaction) => {
       else return interaction.reply({ content:'This item cannot be equipped.', ephemeral:true });
       save(); return interaction.reply(`Equipped **${it.name}**.`);
     }
+    if (interaction.commandName === 'use') {
+      const key = norm(interaction.options.getString('item_key'));
+      if(!me.inventory.includes(key)) return interaction.reply({ content:'You do not have that item.', ephemeral:true });
+      const it = getItem(key);
+      if(!it || it.type!=='consumable') return interaction.reply({ content:'That item is not usable.', ephemeral:true });
+      // Apply effects (flags on user)
+      me._buffs = me._buffs || {};
+      if (key==='health_potion') { me._buffs.raid_extra_hits = (me._buffs.raid_extra_hits||0) + 1; }
+      if (key==='energy_drink') { me._buffs.double_next_log = true; }
+      if (key==='treasure_map') { me._buffs.guaranteed_loot = true; }
+      // remove one
+      const idx = me.inventory.indexOf(key); if (idx>-1) me.inventory.splice(idx,1);
+      save();
+      return interaction.reply(`🧪 Used **${it.name}**. Effect active.`);
+    }
+
     if (interaction.commandName === 'gear') {
       const lvl=levelFromXp(me.xp); const g=gearBonuses(me); const base=basePower(lvl); const total=base+g.totalPow;
       const embed = new EmbedBuilder().setTitle(`${interaction.user.username} — Gear & Bonuses`).setColor(0x8A2BE2)
         .addFields(
           { name:'Level', value:`**${lvl}** (${me.xp.toFixed(1)} XP)`, inline:true },
           { name:'Coins', value:`${me.coins}`, inline:true },
+          { name:'Tokens', value:`${me.tokens}`, inline:true },
           { name:'Power', value:`**${total}** (Base ${base} + Gear ${g.totalPow})`, inline:true },
           { name:'Equipped', value:
             `Weapon: ${me.equipped.weapon? getItem(me.equipped.weapon)?.name : '—'}\n`+
@@ -503,55 +552,72 @@ client.on('interactionCreate', async (interaction) => {
         .addFields(
           { name:'Level', value:`**${lvl}** (${me.xp.toFixed(1)} XP)`, inline:true },
           { name:'Coins', value:`${me.coins}`, inline:true },
+          { name:'Tokens', value:`${me.tokens}`, inline:true },
           { name:'Power', value:`**${base + g.totalPow}**`, inline:true }
         );
       return interaction.reply({ embeds:[embed] });
     }
 
-    /* ---------- Adventure ---------- */
+    /* ---------- Adventure (token-gated, loot-first) ---------- */
     if (interaction.commandName === 'adventure') {
+      if (me.tokens <= 0) return interaction.reply({ content:'You need an **adventure token**. Log a workout to earn tokens!', ephemeral:true });
       const now=Date.now(); if((now-(me.lastAdventure||0))/1000 < store.config.adventureCooldownSec)
         return interaction.reply({ content:`Adventure cooldown. Try again in ${Math.ceil(store.config.adventureCooldownSec - (now-me.lastAdventure)/1000)}s.`, ephemeral:true });
+
+      // consume 1 token
+      me.tokens -= 1; me.lastAdventure=now; save();
 
       const lvl = levelFromXp(me.xp); const g=gearBonuses(me); const base=basePower(lvl);
       const pAtk = base + g.weaponPow, pDef= base + g.armorPow, pHPmax=35+(lvl*3)+(g.armorPow*4);
       const m = pickMonster(lvl);
-      const tierBoost = 1 + (m.tier-1)*0.18 + (lvl*0.005);
-      m.coin = Math.floor(m.coin * tierBoost); m.xp = Math.floor(m.xp * (0.85 + (m.tier-1)*0.07));
       let pHP=pHPmax, mHP=m.hp, rounds=0, log=[];
-      while(pHP>0 && mHP>0 && rounds<14){
+      while(pHP>0 && mHP>0 && rounds<12){
         rounds++;
         const crit=Math.random()<(g.critChance||0);
         let dmg=Math.max(1, Math.floor(pAtk + Math.random()*pAtk/2)); if(crit) dmg=Math.floor(dmg*(g.critDamage||1));
-        mHP-=dmg; log.push(`You hit **${m.name}** for **${dmg}**${crit?' (CRIT!)':''} 〔${Math.max(0,mHP)} HP left〕`); if(mHP<=0) break;
+        mHP-=dmg; log.push(`You hit **${m.name}** for **${dmg}**${(crit?' (CRIT!)':'')} 〔${Math.max(0,mHP)} HP left〕`); if(mHP<=0) break;
         const blocked=Math.random()<(g.block||0);
         let mdmg=Math.max(1, Math.floor(m.atk + Math.random()*m.atk/2) - Math.floor(pDef/3)); if(blocked) mdmg=Math.max(0,Math.floor(mdmg*0.3));
         pHP-=mdmg; log.push(`${m.name} hits you for **${mdmg}**${blocked?' (BLOCK!)':''} 〔${Math.max(0,pHP)} HP left〕`);
       }
-      me.lastAdventure=now;
+
       if(mHP<=0 && pHP>0){
-        const pre=lvl;
-        let xpGain = clamp(m.xp * levelXpMultiplier(pre) * (g.xpMult||1), 0, 6000);
-        let coinGain = clamp(m.coin * levelCoinMultiplier(pre) * (g.coinMult||1), 0, 8000);
-        me.xp += xpGain; me.coins += Math.floor(coinGain);
-        save();
-        const post=levelFromXp(me.xp); if(post>pre) await awardAndAnnounceLevelUp(interaction, uid, pre, post);
+        // small XP/coin, loot-first
+        const baseXP = R(10,20);  // much smaller than workout XP
+        const baseCoins = R(12,28);
+        let xpGain = Math.floor(baseXP * levelXpMultiplier(lvl) * (g.xpMult||1));
+        let coinGain = Math.floor(baseCoins * levelCoinMultiplier(lvl) * (g.coinMult||1));
+        // guaranteed loot if treasure_map buff
+        let lootKey = null;
+        if (me._buffs?.guaranteed_loot) { lootKey = rollLoot(); me._buffs.guaranteed_loot=false; }
+        else if (Math.random() < 0.45) { lootKey = rollLoot(); } // ~45% to get *some* loot (often consumables)
+        if (lootKey) { me.inventory.push(lootKey); }
+        me.xp += xpGain; me.coins += coinGain; save();
+        const post=levelFromXp(me.xp); const pre=lvl; if(post>pre) await awardAndAnnounceLevelUp(interaction, uid, pre, post);
+
+        const rewardText =
+          `✨ XP: **${xpGain}**  |  🪙 Coins: **${coinGain}**` +
+          (lootKey? `\n🎁 Loot: **${getItem(lootKey)?.name || lootKey}**` : '');
+
         const embed = new EmbedBuilder().setTitle(`⚔️ Adventure — Victory vs ${m.name}!`).setColor(0xFFD166)
           .setDescription(log.join('\n'))
           .addFields(
-            { name:'Rewards', value:`✨ XP: **${Math.floor(xpGain)}**  |  🪙 Coins: **${Math.floor(coinGain)}**`, inline:false },
-            { name:'Totals',  value:`${me.xp.toFixed(1)} XP  |  ${me.coins} coins`, inline:false }
+            { name:'Rewards', value: rewardText, inline:false },
+            { name:'Tokens left', value: `${me.tokens}`, inline:true }
           );
         return interaction.reply({ embeds:[embed] });
       } else {
-        const loss = Math.min(40, Math.floor(me.coins*0.06)); me.coins=Math.max(0, me.coins-loss); save();
+        const loss = Math.min(30, Math.floor(me.coins*0.05)); me.coins=Math.max(0, me.coins-loss); save();
         const embed = new EmbedBuilder().setTitle(`💀 Adventure — Defeated by ${m.name}`).setColor(0xEF476F)
-          .setDescription(log.join('\n')).addFields({ name:'Penalty', value: loss?`Lost ${loss} coins`:'No coins lost.', inline:false });
+          .setDescription(log.join('\n')).addFields(
+            { name:'Penalty', value: loss?`Lost ${loss} coins`:'No coins lost.', inline:false },
+            { name:'Tokens left', value:`${me.tokens}`, inline:true }
+          );
         return interaction.reply({ embeds:[embed] });
       }
     }
 
-    /* ---------- Raids ---------- */
+    /* ---------- Raids (unchanged core) ---------- */
     if (interaction.commandName === 'raidstart') {
       const tier = interaction.options.getInteger('tier', true);
       const durationMin = interaction.options.getInteger('duration_min', true);
@@ -576,24 +642,19 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.reply('Raid ended and rewards distributed (scaled for remaining HP).');
     }
 
-    /* ---------- Daily & Streak ---------- */
+    /* ---------- Daily/Streak & Events (from previous build) ---------- */
     if (interaction.commandName === 'daily') {
       const sub = interaction.options.getSubcommand();
-      if (sub === 'show') {
-        ensureDaily(me); save();
-        return interaction.reply({ embeds:[dailyEmbed(me)] });
-      }
+      if (sub === 'show') { ensureDaily(me); save(); return interaction.reply({ embeds:[dailyEmbed(me)] }); }
       if (sub === 'claim') {
         const d = ensureDaily(me);
         const allDone = d.tasks.every(t => (t.progress||0) >= t.target);
         if (!allDone) return interaction.reply({ content:'Complete all 3 tasks before claiming.', ephemeral:true });
         if (d.claimed) return interaction.reply({ content:'Already claimed for today 🎉', ephemeral:true });
-        // sum rewards + chest bonus
         const xpGain = d.tasks.reduce((a,t)=>a+t.rewardXp,0) + 100;
         const coinGain = d.tasks.reduce((a,t)=>a+t.rewardCoins,0) + 100;
         const pre=levelFromXp(me.xp);
         me.xp += xpGain; me.coins += coinGain; d.claimed = true;
-        // streak bonus at milestones
         const bonus = (me.streak>0 && me.streak%7===0) ? 150 : 0;
         if (bonus) me.coins += bonus;
         save();
@@ -601,11 +662,8 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.reply(`✅ Claimed daily chest: +${xpGain} XP, +${coinGain} coins${bonus?` (+${bonus} weekly streak bonus)`:''}!`);
       }
     }
-    if (interaction.commandName === 'streak') {
-      return interaction.reply(`🔥 **${interaction.user.username}** streak: **${me.streak}** day(s). Keep it going!`);
-    }
+    if (interaction.commandName === 'streak') return interaction.reply(`🔥 **${interaction.user.username}** streak: **${me.streak}** day(s). Keep it going!`);
 
-    /* ---------- Events ---------- */
     if (interaction.commandName === 'eventcreate') {
       const title = interaction.options.getString('title', true);
       const minsFromNow = interaction.options.getInteger('minutes_from_now', true);
@@ -637,31 +695,96 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-/* ---------------- Component handlers ---------------- */
-async function handleQuickLogComponent(inter){
-  const id = inter.customId; const msgId = inter.message.id;
-  let s = quickState.get(msgId) || { userId: inter.user.id, exercise:null, amount:0, unit:null };
-  if (id === 'ql:select') {
-    const choice = inter.values?.[0];
-    s.exercise = choice; s.unit = (BUILT_INS[choice]?.unit) || 'reps';
-    quickState.set(msgId, s);
-    return inter.update({ content: panelText(s), components: inter.message.components });
-  }
-  if (id.startsWith('ql:+')) {
-    const inc = Number(id.split('+')[1]); s.amount = (s.amount||0) + inc; quickState.set(msgId, s);
-    return inter.update({ content: panelText(s), components: inter.message.components });
-  }
-  if (id === 'ql:reset') { s.amount = 0; quickState.set(msgId, s); return inter.update({ content: panelText(s), components: inter.message.components }); }
-  if (id === 'ql:cancel') { quickState.delete(msgId); return inter.update({ content:'Quick Log canceled.', components: [] }); }
-  if (id === 'ql:submit') {
-    if (!s.exercise || !s.amount || s.amount<=0) return inter.reply({ content:'Pick a workout and add some amount.', ephemeral:true });
-    const me = ensureUser(inter.user.id);
-    await doLog(inter, me, { exercise:s.exercise, amount:s.amount, unit:s.unit }, { replyEphemeral:false, isComponent:true });
-    quickState.delete(msgId); try { await inter.message.edit({ components: [] }); } catch {}
-    return;
-  }
+/* ---------------- Daily quests (from previous build) ---------------- */
+function ensureDaily(user){
+  if (user.daily && user.daily.date === todayISO()) return user.daily;
+  const tasks = [];
+  const pick = (arr)=>arr[R(0,arr.length-1)];
+  const t1 = { type:'pushups', desc:'Do pushups', unit:'reps', target: pick([30,60,100]), progress:0, rewardXp: pick([70,90]), rewardCoins: pick([40,60]) };
+  const t2 = { type:'plank',   desc:'Hold plank (sec)', unit:'seconds', target: pick([60,120,180]), progress:0, rewardXp: pick([60,80]), rewardCoins: pick([35,55]) };
+  const t3 = { type:'run_miles',desc:'Run (miles)', unit:'miles', target: pick([1,2,3]), progress:0, rewardXp: pick([100,140]), rewardCoins: pick([60,90]) };
+  tasks.push(t1,t2,t3);
+  user.daily = { date: todayISO(), tasks, claimed: false };
+  return user.daily;
+}
+function applyDailyProgress(user, exercise, amount, unit){
+  const d = ensureDaily(user);
+  for (const t of d.tasks) if (t.type === exercise && (t.unit === unit || !unit)) t.progress = Math.min(t.target, (t.progress||0) + amount);
+}
+function dailyEmbed(user){
+  const d=ensureDaily(user);
+  const lines = d.tasks.map((t,i)=>{
+    const pct = Math.min(100, Math.floor((t.progress/t.target)*100));
+    return `${i+1}. **${t.desc}** — ${t.progress}/${t.target} ${t.unit} 〔${pct}%〕  → Reward: +${t.rewardXp} XP, +${t.rewardCoins} coins`;
+  });
+  return new EmbedBuilder().setTitle(`📅 Daily Quests — ${d.date}`).setColor(0x00C2FF)
+    .setDescription(lines.join('\n') + `\n\nUse **/daily claim** when all three are complete.`);
 }
 
+/* ---------------- Logging core (now grants tokens) ---------------- */
+async function doLog(interaction, me, { exercise, amount, unit, weight, weightUnit }, opts={}){
+  const now=Date.now();
+  if ((now-(me.lastLog||0))/1000 < store.config.logCooldownSec)
+    return interaction.reply({ content:`Cooldown: try again in ${Math.ceil(store.config.logCooldownSec - (now-me.lastLog)/1000)}s.`, ephemeral:true });
+
+  const exKey = norm(exercise);
+  const { xp, basis } = computeXP({ exercise:exKey, amount, unit, weight, weightUnit });
+  const preLevel = levelFromXp(me.xp);
+  const g=gearBonuses(me);
+
+  // Energy Drink: double next log
+  const double = !!(me._buffs && me._buffs.double_next_log);
+  if (double) { if (me._buffs) me._buffs.double_next_log = false; }
+  let gain = xp * (double?2:1);
+  gain = clamp(gain * levelXpMultiplier(preLevel) * (g.xpMult||1), 0, 100000);
+  me.xp += gain;
+  const coinsEarned = Math.floor((gain/10) * levelCoinMultiplier(preLevel) * (g.coinMult||1));
+  me.coins += coinsEarned;
+
+  // Adventure tokens: +1 per log, +1 per each full 100 XP from this log (cap +5)
+  let tokenGain = 1 + Math.min(5, Math.floor(gain / 100));
+  me.tokens += tokenGain;
+
+  me.lastLog = now; touchStreak(me); applyDailyProgress(me, exKey, amount, unit); save();
+
+  const postLevel = levelFromXp(me.xp);
+  if (postLevel > preLevel) await awardAndAnnounceLevelUp(interaction, interaction.user.id, preLevel, postLevel);
+
+  const embed = new EmbedBuilder().setTitle('Workout Logged').setColor(0x00c2ff)
+    .setDescription(`${interaction.user.username} logged **${amount} ${unit || (BUILT_INS[exKey]?.unit || '')} ${exKey}**`)
+    .addFields(
+      { name:'Basis', value:basis, inline:true },
+      { name:'XP', value:`${gain.toFixed(1)} ${double?'(x2 Energy Drink)': ''}`, inline:true },
+      { name:'Coins', value:`${coinsEarned}`, inline:true },
+      { name:'Tokens', value:`+${tokenGain} → **${me.tokens}**`, inline:true },
+      { name:'Totals', value:`${me.xp.toFixed(1)} XP | ${me.coins} coins | 🔥 Streak: ${me.streak}`, inline:false }
+    );
+
+  if (opts.isComponent) return interaction.followUp({ embeds:[embed], ephemeral:false });
+  else return interaction.reply({ embeds:[embed] });
+}
+
+/* ---------------- Level-up announce ---------------- */
+async function awardAndAnnounceLevelUp(interaction, userId, prev, now){
+  try { const guild=await client.guilds.fetch(guildId); const member=await guild.members.fetch(userId); await grantLevelRoles(guild, member, prev, now); } catch {}
+  const me = ensureUser(userId);
+  const levels = now - prev;
+  const coinBonus = levels * (20 + Math.floor(now*1.2));
+  me.coins += coinBonus;
+  // occasional cosmetic at milestones
+  let loot=''; if(now%5===0 && Math.random()<0.30){ const cos=store.shop.items.filter(i=>i.type==='cosmetic'); if(cos.length){ const L=cos[R(0,cos.length-1)]; me.inventory.push(L.key); loot = `\n🎁 Bonus loot: **${L.name}**`; } }
+  save();
+  const embed = new EmbedBuilder().setTitle('🎉 Level Up!').setColor(0x37d67a)
+    .setDescription(`**${interaction.user.username}** reached **Level ${now}**!`)
+    .addFields({ name:'Rewards', value:`+${coinBonus} coins${loot}`, inline:false });
+  try {
+    const chId = store.config.levelUpChannelId;
+    if (chId) (await client.channels.fetch(chId)).send({ embeds:[embed] });
+    else interaction.channel.send({ embeds:[embed] });
+  } catch {}
+}
+
+/* ---------------- Raid handlers (consumable extra hits) ---------------- */
 async function handleRaidComponent(inter){
   const r = store.raids.active; if(!r) return inter.reply({ content:'No active raid.', ephemeral:true });
   if (Date.now() > r.endsAt) { await finalizeRaid(r, inter.channel, true); return inter.reply({ content:'Raid has ended. Rewards distributed.', ephemeral:true }); }
@@ -670,21 +793,29 @@ async function handleRaidComponent(inter){
   if (inter.customId === 'raid:status') return inter.reply({ embeds:[raidEmbed(r)], ephemeral:true });
   if (inter.customId === 'raid:hit') {
     const me = ensureUser(uid);
-    const now=Date.now(); if((now-(me.lastRaidHit||0))/1000 < store.config.raidHitCooldownSec)
-      return inter.reply({ content:`Cooldown: wait ${Math.ceil(store.config.raidHitCooldownSec - (now-me.lastRaidHit)/1000)}s.`, ephemeral:true });
+    const now=Date.now();
+    const extra = (me._buffs?.raid_extra_hits||0) > 0;
+    const cd = store.config.raidHitCooldownSec;
+    if ((now-(me.lastRaidHit||0))/1000 < cd && !extra)
+      return inter.reply({ content:`Cooldown: wait ${Math.ceil(cd - (now-me.lastRaidHit)/1000)}s.`, ephemeral:true });
+
+    // spend extra hit if present and still on cooldown
+    if ((now-(me.lastRaidHit||0))/1000 < cd && extra) me._buffs.raid_extra_hits -= 1;
+    else me.lastRaidHit = now;
+
     const lvl=levelFromXp(me.xp); const g=gearBonuses(me); const base=basePower(lvl);
     const tier=r.tier;
     const baseDmg = base + g.weaponPow + Math.floor(lvl/3) + tier*2;
     let dmg = Math.max(1, Math.floor(baseDmg + Math.random()*baseDmg/2));
     if (Math.random() < (g.critChance||0)) dmg = Math.floor(dmg * (g.critDamage||1));
-    me.lastRaidHit=now; save();
+    save();
+
     r.hp = Math.max(0, r.hp - dmg); r.contributions[uid] = (r.contributions[uid]||0) + dmg; save();
     try { const ch=await client.channels.fetch(r.channelId); const msg=await ch.messages.fetch(r.messageId); await msg.edit({ embeds:[raidEmbed(r)], components: raidButtons() }); } catch {}
     if(r.hp<=0){ await finalizeRaid(r, inter.channel, true); return inter.reply({ content:`You dealt **${dmg}** and landed the finishing blow! 🎉`, ephemeral:true }); }
     else return inter.reply({ content:`You hit for **${dmg}**! Boss HP now **${r.hp}/${r.maxHp}**.`, ephemeral:true });
   }
 }
-
 async function finalizeRaid(r, channel, defeated){
   const totalDmg = Object.values(r.contributions||{}).reduce((a,b)=>a+b,0);
   const participation = Object.keys(r.contributions||{}).length;
@@ -693,10 +824,8 @@ async function finalizeRaid(r, channel, defeated){
   const hpFactor = defeated ? 1.0 : Math.max(0.25, 1 - (r.hp / r.maxHp));
   const poolXP   = Math.floor(tierPoolXP * hpFactor * (1 + participation*0.03));
   const poolCoin = Math.floor(tierPoolCoin * hpFactor * (1 + participation*0.03));
-
-  if (totalDmg <= 0) {
-    await channel.send('Raid ended, but no one dealt damage. No rewards.');
-  } else {
+  if (totalDmg <= 0) { await channel.send('Raid ended, but no one dealt damage. No rewards.'); }
+  else {
     let lines=[];
     for (const [id, dmg] of Object.entries(r.contributions)) {
       const share = dmg/totalDmg;
@@ -722,53 +851,59 @@ async function finalizeRaid(r, channel, defeated){
   store.raids.active = null; save();
 }
 
-/* ---------------- Logging core (updates streak & dailies) ---------------- */
-async function doLog(interaction, me, { exercise, amount, unit, weight, weightUnit }, opts={}){
-  const now=Date.now();
-  if ((now-(me.lastLog||0))/1000 < store.config.logCooldownSec)
-    return interaction.reply({ content:`Cooldown: try again in ${Math.ceil(store.config.logCooldownSec - (now-me.lastLog)/1000)}s.`, ephemeral:true });
-
-  const exKey = norm(exercise);
-  const { xp, basis } = computeXP({ exercise:exKey, amount, unit, weight, weightUnit });
-  const preLevel = levelFromXp(me.xp);
-  const g=gearBonuses(me);
-
-  let gain = clamp(xp * levelXpMultiplier(preLevel) * (g.xpMult||1), 0, 100000);
-  me.xp += gain;
-  const coinsEarned = Math.floor((gain/10) * levelCoinMultiplier(preLevel) * (g.coinMult||1));
-  me.coins += coinsEarned;
-  me.lastLog = now;
-
-  // streak & dailies
-  touchStreak(me);
-  applyDailyProgress(me, exKey, amount, unit);
-  save();
-
-  const postLevel = levelFromXp(me.xp);
-  if (postLevel > preLevel) await awardAndAnnounceLevelUp(interaction, interaction.user.id, preLevel, postLevel);
-
-  const embed = new EmbedBuilder().setTitle('Workout Logged').setColor(0x00c2ff)
-    .setDescription(`${interaction.user.username} logged **${amount} ${unit || (BUILT_INS[exKey]?.unit || '')} ${exKey}**`)
-    .addFields(
-      { name:'Basis', value:basis, inline:true },
-      { name:'XP', value:`${gain.toFixed(1)}`, inline:true },
-      { name:'Coins', value:`${coinsEarned}`, inline:true },
-      { name:'Totals', value:`${me.xp.toFixed(1)} XP | ${me.coins} coins | 🔥 Streak: ${me.streak}`, inline:false }
-    );
-
-  if (opts.isComponent) return interaction.followUp({ embeds:[embed], ephemeral:false });
-  else return interaction.reply({ embeds:[embed] });
+/* ---------------- QuickLog components ---------------- */
+async function handleQuickLogComponent(inter){
+  const id = inter.customId; const msgId = inter.message.id;
+  let s = quickState.get(msgId) || { userId: inter.user.id, exercise:null, amount:0, unit:null };
+  if (id === 'ql:select') {
+    const choice = inter.values?.[0];
+    s.exercise = choice; s.unit = (BUILT_INS[choice]?.unit) || 'reps';
+    quickState.set(msgId, s);
+    return inter.update({ content: panelText(s), components: inter.message.components });
+  }
+  if (id.startsWith('ql:+')) {
+    const inc = Number(id.split('+')[1]); s.amount = (s.amount||0) + inc; quickState.set(msgId, s);
+    return inter.update({ content: panelText(s), components: inter.message.components });
+  }
+  if (id === 'ql:reset') { s.amount = 0; quickState.set(msgId, s); return inter.update({ content: panelText(s), components: inter.message.components }); }
+  if (id === 'ql:cancel') { quickState.delete(msgId); return inter.update({ content:'Quick Log canceled.', components: [] }); }
+  if (id === 'ql:submit') {
+    if (!s.exercise || !s.amount || s.amount<=0) return inter.reply({ content:'Pick a workout and add some amount.', ephemeral:true });
+    const me = ensureUser(inter.user.id);
+    await doLog(inter, me, { exercise:s.exercise, amount:s.amount, unit:s.unit }, { replyEphemeral:false, isComponent:true });
+    quickState.delete(msgId); try { await inter.message.edit({ components: [] }); } catch {}
+    return;
+  }
 }
 
-/* ---------------- Level-up announce ---------------- */
+/* ---------------- Events ticker ---------------- */
+function startEventTicker(){
+  setInterval(async () => {
+    const now = Date.now();
+    const toRemove = [];
+    for (const ev of store.events) {
+      if (ev.remindMins && ev.remindMins.length) {
+        const minsUntil = Math.ceil((ev.at - now) / 60000);
+        if (minsUntil <= 0) { try { const ch=await client.channels.fetch(ev.channelId); await ch.send(`📣 **${ev.title}** is starting **now**!`); } catch {} toRemove.push(ev.id); }
+        else {
+          const idx = ev.remindMins.indexOf(minsUntil);
+          if (idx !== -1) { try { const ch=await client.channels.fetch(ev.channelId); await ch.send(`⏰ **${ev.title}** starts in **${minsUntil} min**.`); } catch {} ev.remindMins.splice(idx,1); save(); }
+        }
+      } else if (now >= ev.at) { try { const ch=await client.channels.fetch(ev.channelId); await ch.send(`📣 **${ev.title}** is starting **now**!`); } catch {} toRemove.push(ev.id); }
+    }
+    if (toRemove.length) { store.events = store.events.filter(e=>!toRemove.includes(e.id)); save(); }
+  }, 30 * 1000);
+}
+
+/* ---------------- Register commands login ---------------- */
+const rest2 = new REST({ version:'10' }).setToken(token);
 async function awardAndAnnounceLevelUp(interaction, userId, prev, now){
   try { const guild=await client.guilds.fetch(guildId); const member=await guild.members.fetch(userId); await grantLevelRoles(guild, member, prev, now); } catch {}
   const me = ensureUser(userId);
   const levels = now - prev;
-  const coinBonus = levels * (30 + Math.floor(now*1.5));
+  const coinBonus = levels * (20 + Math.floor(now*1.2));
   me.coins += coinBonus;
-  // 20% chance cosmetic
-  let loot=''; if(Math.random()<0.20){ const cos=store.shop.items.filter(i=>i.type==='cosmetic'); if(cos.length){ const L=cos[R(0,cos.length-1)]; me.inventory.push(L.key); loot = `\n🎁 Bonus loot: **${L.name}**`; } }
+  let loot=''; if(now%5===0 && Math.random()<0.30){ const cos=store.shop.items.filter(i=>i.type==='cosmetic'); if(cos.length){ const L=cos[R(0,cos.length-1)]; me.inventory.push(L.key); loot = `\n🎁 Bonus loot: **${L.name}**`; } }
   save();
   const embed = new EmbedBuilder().setTitle('🎉 Level Up!').setColor(0x37d67a)
     .setDescription(`**${interaction.user.username}** reached **Level ${now}**!`)
@@ -780,38 +915,31 @@ async function awardAndAnnounceLevelUp(interaction, userId, prev, now){
   } catch {}
 }
 
-/* ---------------- Event ticker (checks reminders & starts) ---------------- */
-function startEventTicker(){
-  setInterval(async () => {
-    const now = Date.now();
-    const toRemove = [];
-    for (const ev of store.events) {
-      // Reminders
-      if (ev.remindMins && ev.remindMins.length) {
-        const minsUntil = Math.ceil((ev.at - now) / 60000);
-        if (minsUntil <= 0) {
-          // Start message
-          try { const ch=await client.channels.fetch(ev.channelId); await ch.send(`📣 **${ev.title}** is starting **now**!`); } catch {}
-          toRemove.push(ev.id);
-        } else {
-          // send "X minutes left" reminder if exact match
-          const idx = ev.remindMins.indexOf(minsUntil);
-          if (idx !== -1) {
-            try { const ch=await client.channels.fetch(ev.channelId); await ch.send(`⏰ **${ev.title}** starts in **${minsUntil} min**.`); } catch {}
-            // prevent duplicate: remove this reminder entry
-            ev.remindMins.splice(idx,1); save();
-          }
-        }
-      } else if (now >= ev.at) {
-        try { const ch=await client.channels.fetch(ev.channelId); await ch.send(`📣 **${ev.title}** is starting **now**!`); } catch {}
-        toRemove.push(ev.id);
-      }
-    }
-    if (toRemove.length) {
-      store.events = store.events.filter(e=>!toRemove.includes(e.id)); save();
-    }
-  }, 30 * 1000); // check twice per minute
+/* ---------------- Required: daily helpers reused ---------------- */
+function dailyEmbed(user){
+  const d=ensureDaily(user);
+  const lines = d.tasks.map((t,i)=>{
+    const pct = Math.min(100, Math.floor((t.progress/t.target)*100));
+    return `${i+1}. **${t.desc}** — ${t.progress}/${t.target} ${t.unit} 〔${pct}%〕  → Reward: +${t.rewardXp} XP, +${t.rewardCoins} coins`;
+  });
+  return new EmbedBuilder().setTitle(`📅 Daily Quests — ${d.date}`).setColor(0x00C2FF)
+    .setDescription(lines.join('\n') + `\n\nUse **/daily claim** when all three are complete.`);
+}
+function ensureDaily(user){
+  if (user.daily && user.daily.date === todayISO()) return user.daily;
+  const tasks = [];
+  const pick = (arr)=>arr[R(0,arr.length-1)];
+  const t1 = { type:'pushups', desc:'Do pushups', unit:'reps', target: pick([30,60,100]), progress:0, rewardXp: pick([70,90]), rewardCoins: pick([40,60]) };
+  const t2 = { type:'plank',   desc:'Hold plank (sec)', unit:'seconds', target: pick([60,120,180]), progress:0, rewardXp: pick([60,80]), rewardCoins: pick([35,55]) };
+  const t3 = { type:'run_miles',desc:'Run (miles)', unit:'miles', target: pick([1,2,3]), progress:0, rewardXp: pick([100,140]), rewardCoins: pick([60,90]) };
+  tasks.push(t1,t2,t3);
+  user.daily = { date: todayISO(), tasks, claimed: false };
+  return user.daily;
+}
+function applyDailyProgress(user, exercise, amount, unit){
+  const d = ensureDaily(user);
+  for (const t of d.tasks) if (t.type === exercise && (t.unit === unit || !unit)) t.progress = Math.min(t.target, (t.progress||0) + amount);
 }
 
-/* ---------------- Login ---------------- */
+/* ---------------- END ---------------- */
 client.login(token);
