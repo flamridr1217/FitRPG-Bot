@@ -1,6 +1,5 @@
 // FitRPG Bot — Mobile-first RPG (Images-only art, easy XP, raids auto-update, hunts 1–5, inventory & adventure)
 // CommonJS + discord.js v14
-// IMPORTANT: add package.json with Node 20 + type: commonjs (see bottom of this message).
 
 const {
   Client, GatewayIntentBits,
@@ -39,6 +38,8 @@ const guildId  = process.env.GUILD_ID;  // Server (Guild) ID
 const LEVELUP_CHANNEL_ID = process.env.LEVELUP_CHANNEL_ID || null;
 const DAILY_CHANNEL_ID   = process.env.DAILY_CHANNEL_ID   || null;
 const MONGO_URI          = process.env.MONGO_URI || null;
+// Optional celebratory GIF for level-ups
+const LEVELUP_GIF = process.env.LEVELUP_GIF || 'https://media.tenor.com/nK0S5zF7x-oAAAAC/confetti-celebrate.gif';
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers]
@@ -57,14 +58,14 @@ async function initMongo(){
 const DATA_FILE = 'data.json';
 
 let store = {
-  users: {},           // id -> user state
-  shop: { items: [] }, // static items; we build defaults if empty
+  users: {},            // id -> user state
+  shop: { items: [] },  // static items; we build defaults if empty
   events: [],
-  raids: {},           // channelId -> { ... , messageId }
-  hunts: {},           // channelId -> hunt object
+  raids: {},            // channelId -> { ... , messageId }
+  hunts: {},            // channelId -> hunt object
   bounties: { dailyKey: null, daily: null },
-  artMap: {},          // key -> image url for items/monsters/pets/mounts
-  _todayDaily: {},     // dateISO -> { theme, tasks }
+  artMap: {},           // key -> image url for items/monsters/pets/mounts
+  _todayDaily: {},      // dateISO -> { theme, tasks }
   config: {
     timezoneNote: 'America/Chicago',
     levelUpChannelId: LEVELUP_CHANNEL_ID,
@@ -84,7 +85,8 @@ function ensureUser(id){
     equipped:{weapon:null,armor:null,trinket:null,cosmetic:null, pet:null, mount:null},
     lastLog:0, lastRaidHit:0, lastHunt:0, lastAdventure:0,
     lastActiveISO:null, streak:0,
-    dailyProgress:{},
+    dailyProgress:{},        // flags (claimed)
+    dailyLogs:{},            // per-day counters { 'YYYY-MM-DD': { pushups: n, ... } }
     _buffs:{},
     bestiary:{} // name -> kills
   };
@@ -119,18 +121,19 @@ function R(min,max){ return Math.floor(Math.random()*(max-min+1))+min; }
 function clamp(n,lo,hi){ return Math.max(lo, Math.min(hi, n)); }
 function todayISO(){ return new Date().toISOString().slice(0,10); }
 function getNowInTZ(tz) { return new Date(new Date().toLocaleString('en-US', { timeZone: tz })); }
+function addDailyLog(u, type, amount){
+  const key = todayISO();
+  if (!u.dailyLogs[key]) u.dailyLogs[key] = {};
+  u.dailyLogs[key][type] = (u.dailyLogs[key][type]||0) + amount;
+}
 
-/* ---------------- XP / Level (reverted easier model) ---------------- */
-/* Per your earlier preference:
-   - Running: 40 XP per mile
-   - Pushups: 0.50 XP / rep
-   - Plank:   0.20 XP / sec
-   + Similar for other moves
-   Level curve: smooth, fast early, still scales to 1000. */
+/* ---------------- XP / Level (power exponent 1.05, snappier) ---------------- */
+// This is a polynomial curve with exponent 1.05 (was 1.08). Faster early, still scales.
 function xpForLevel(level){
-  if (level <= 1) return 80;
-  const base = 45;                 // lower than before (easier)
-  return Math.floor(base * Math.pow(level, 1.08) + 30);
+  if (level <= 1) return 60;
+  const base = 40;                   // base weight
+  const expo = 1.05;                 // your requested exponent
+  return Math.floor(base * Math.pow(level, expo) + 25);
 }
 function totalXpForLevel(level){
   let t=0; for (let i=1;i<=level;i++) t += xpForLevel(i); return t;
@@ -209,26 +212,26 @@ function buildShopItems(){
     { name:'Omega Bulwark',      type:'armor', tier:10, def:90, price:15800 }
   ];
   const trinkets = [
-    { name:'Lucky Charm',         type:'trinket', tier:2,  bonus:'+2% coins',           price:800  },
-    { name:'Runner’s Band',       type:'trinket', tier:2,  bonus:'+3% run XP',          price:1000 },
-    { name:'Focus Bead',          type:'trinket', tier:3,  bonus:'+3% all XP',          price:1800 },
-    { name:'Philosopher’s Sigil', type:'trinket', tier:5,  bonus:'+4% all XP',          price:3200 },
-    { name:'King’s Crest',        type:'trinket', tier:6,  bonus:'+6% coins',           price:4200 },
-    { name:'Eternal Compass',     type:'trinket', tier:7,  bonus:'+8% adventure loot',  price:5600 },
-    { name:'Fateweaver Charm',    type:'trinket', tier:8,  bonus:'+10% hunt loot',      price:7200 },
-    { name:'Celestial Relic',     type:'trinket', tier:9,  bonus:'+12% all XP',         price:9200 },
-    { name:'Omniscient Eye',      type:'trinket', tier:10, bonus:'+14% all XP',         price:12000 }
+    { name:'Lucky Charm',         type:'trinket', tier:2,  bonus:'+2% coins',               price:800  },
+    { name:'Runner’s Band',       type:'trinket', tier:2,  bonus:'+3% run XP',              price:1000 },
+    { name:'Focus Bead',          type:'trinket', tier:3,  bonus:'+3% all XP',              price:1800 },
+    { name:'Philosopher’s Sigil', type:'trinket', tier:5,  bonus:'+4% all XP',              price:3200 },
+    { name:'King’s Crest',        type:'trinket', tier:6,  bonus:'+6% coins',               price:4200 },
+    { name:'Eternal Compass',     type:'trinket', tier:7,  bonus:'+8% adventure loot',      price:5600 },
+    { name:'Fateweaver Charm',    type:'trinket', tier:8,  bonus:'+10% hunt loot',          price:7200 },
+    { name:'Celestial Relic',     type:'trinket', tier:9,  bonus:'+12% all XP',             price:9200 },
+    { name:'Omniscient Eye',      type:'trinket', tier:10, bonus:'+14% all XP',             price:12000 }
   ];
   const pets = [
-    { name:'Pocket Slime',   type:'pet',   tier:2,  bonus:'+2% XP from logs',          price:900  },
-    { name:'Trail Hawk',     type:'pet',   tier:3,  bonus:'+3% run XP',                price:1200 },
-    { name:'Cinder Pup',     type:'pet',   tier:4,  bonus:'+3 Power in hunts',         price:1800 },
-    { name:'Glacier Cub',    type:'pet',   tier:5,  bonus:'+4% plank XP',              price:2400 },
-    { name:'Storm Lynx',     type:'pet',   tier:6,  bonus:'+5% coins',                 price:3200 },
-    { name:'Dune Raptor',    type:'pet',   tier:7,  bonus:'+6% hunt loot',             price:4200 },
-    { name:'Aether Wisp',    type:'pet',   tier:8,  bonus:'+8% all XP',                price:5600 },
-    { name:'Sun Phoenix',    type:'pet',   tier:9,  bonus:'+10% adventure loot',       price:7400 },
-    { name:'Time Dragonling',type:'pet',   tier:10, bonus:'+12% all XP, +2 raid Power',price:9800 }
+    { name:'Pocket Slime',   type:'pet',   tier:2,  bonus:'+2% XP from logs',            price:900  },
+    { name:'Trail Hawk',     type:'pet',   tier:3,  bonus:'+3% run XP',                  price:1200 },
+    { name:'Cinder Pup',     type:'pet',   tier:4,  bonus:'+3 Power in hunts',           price:1800 },
+    { name:'Glacier Cub',    type:'pet',   tier:5,  bonus:'+4% plank XP',                price:2400 },
+    { name:'Storm Lynx',     type:'pet',   tier:6,  bonus:'+5% coins',                   price:3200 },
+    { name:'Dune Raptor',    type:'pet',   tier:7,  bonus:'+6% hunt loot',               price:4200 },
+    { name:'Aether Wisp',    type:'pet',   tier:8,  bonus:'+8% all XP',                  price:5600 },
+    { name:'Sun Phoenix',    type:'pet',   tier:9,  bonus:'+10% adventure loot',         price:7400 },
+    { name:'Time Dragonling',type:'pet',   tier:10, bonus:'+12% all XP, +2 raid Power',  price:9800 }
   ];
   const mounts = [
     { name:'Sprint Goat',   type:'mount', tier:3,  bonus:'+5% hunt token chance',   price:1500 },
@@ -257,16 +260,15 @@ function artURL(key){
 
 /* ---------------- Exercise themes (for hunts/raids) ---------------- */
 const EXERCISE_THEMES = {
-  pushups:      { label:'Pushups',      unit:'reps',   key:'pushups' },
-  squats:       { label:'Bodyweight Squats', unit:'reps', key:'squats' },
-  situps:       { label:'Sit-ups',      unit:'reps',   key:'situps' },
-  pullups:      { label:'Pull-ups',     unit:'reps',   key:'pullups' },
-  burpees:      { label:'Burpees',      unit:'reps',   key:'burpees' },
-  plank_seconds:{ label:'Plank (seconds)', unit:'seconds', key:'plank' },
-  run_miles:    { label:'Run Distance', unit:'miles',  key:'run_miles' }
+  pushups:       { label:'Pushups',       unit:'reps',   key:'pushups' },
+  squats:        { label:'Bodyweight Squats', unit:'reps', key:'squats' },
+  situps:        { label:'Sit-ups',       unit:'reps',   key:'situps' },
+  pullups:       { label:'Pull-ups',      unit:'reps',   key:'pullups' },
+  burpees:       { label:'Burpees',       unit:'reps',   key:'burpees' },
+  plank_seconds: { label:'Plank (seconds)', unit:'seconds', key:'plank' },
+  run_miles:     { label:'Run Distance',  unit:'miles',  key:'run_miles' }
 };
 function targetFor(exercise, partySize){
-  // Your examples: 1:100 pushups / 3:500 / 5:800, roughly scale
   const base = {
     pushups:100, squats:150, situps:120, pullups:25, burpees:50, plank_seconds:180, run_miles:2
   };
@@ -277,7 +279,7 @@ function targetFor(exercise, partySize){
     : b + (add[partySize] ?? 0);
 }
 
-/* ---------------- Daily Challenges + Bounties (unchanged from last build) ---------------- */
+/* ---------------- Daily Challenges + Bounties (with verification) ---------------- */
 function Rrange(a,b){ return R(a,b); }
 function generateDaily(){
   const packs = [
@@ -320,7 +322,7 @@ function generateDailyBounty(){
   return {
     date: todayISO(),
     tasks: [
-      { type:'pushups',   desc:'Pushups',            unit:'reps',   target: Rrange(120,200), rewardXp:Rrange(120,200), rewardCoins:Rrange(80,130) },
+      { type:'pushups',   desc:'Pushups',           unit:'reps',   target: Rrange(120,200), rewardXp:Rrange(120,200), rewardCoins:Rrange(80,130) },
       { type:'squats',    desc:'Bodyweight Squats', unit:'reps',   target: Rrange(140,220), rewardXp:Rrange(120,180), rewardCoins:Rrange(70,110) },
       { type:'run_miles', desc:'Run Distance',      unit:'miles',  target: 2,               rewardXp:Rrange(140,190), rewardCoins:Rrange(80,120) }
     ]
@@ -339,6 +341,11 @@ function bountyEmbed(){
   const b = ensureDailyBounty();
   const lines = b.tasks.map(t=>`• **${t.desc}** — ${t.target} ${t.unit} 〔+${t.rewardXp} XP, +${t.rewardCoins} coins〕`);
   return new EmbedBuilder().setTitle(`🎯 Bounty Board — ${b.date}`).setColor(0xE67E22).setDescription(lines.join('\n'));
+}
+function hasMetTasks(user, tasks){
+  const day = todayISO();
+  const logs = user.dailyLogs?.[day] || {};
+  return tasks.every(t => (logs[t.type]||0) >= (t.target||0));
 }
 
 /* ---------------- Shop paging ---------------- */
@@ -369,11 +376,11 @@ function shopEmbed(page=1){
 
 /* ---------------- Hunts (workout-gated, party size 1–5) ---------------- */
 const HUNT_REWARDS = {
-  1: { coins:[120,220], xp:[150,240], gearOdds: 0.18 },
-  2: { coins:[180,300], xp:[200,320], gearOdds: 0.22 },
-  3: { coins:[220,380], xp:[260,420], gearOdds: 0.28 },
-  4: { coins:[300,520], xp:[320,540], gearOdds: 0.34 },
-  5: { coins:[360,600], xp:[380,640], gearOdds: 0.38 }
+  1: { coins:[120,220], xp:[150,240] },
+  2: { coins:[180,300], xp:[200,320] },
+  3: { coins:[220,380], xp:[260,420] },
+  4: { coins:[300,520], xp:[320,540] },
+  5: { coins:[360,600], xp:[380,640] }
 };
 function getActiveHunt(channelId){ return store.hunts[channelId] || null; }
 function openHunt(channelId, partySize, exercise, starterId){
@@ -450,20 +457,27 @@ async function resolveHunt(channel){
       const xp    = R(pay.xp[0],    pay.xp[1]);
       u.coins += coins; u.xp += xp;
 
-      const lvl = levelFromXp(u.xp);
-      const pool = filterGearByTier(store.shop.items, lvl);
-      let lootText = 'No gear this time.';
-      if (pool.length && Math.random() < pay.gearOdds) {
-        const item = pool[R(0, pool.length-1)];
+      // Guaranteed ≥1 consumable + gacha
+      const lootLines = [];
+      const guaranteed = randomConsumable();
+      u.inventory.push(guaranteed.name);
+      lootLines.push(`**${guaranteed.name}** (consumable)`);
+
+      const extra = rollGachaHunt(levelFromXp(u.xp));
+      if (extra) {
+        const { kind, item } = extra;
         u.inventory.push(item.name);
-        lootText = `**${item.name}** (T${item.tier})`;
-        showcaseItem(channel, uid, item.name, '🗡️ Hunt Loot');
+        lootLines.push(`**${item.name}** (${kind})`);
+        if (kind==='gear') showcaseItem(channel, uid, item.name, '🗡️ Hunt Loot');
       }
-      lines.push(`• <@${uid}>: **+${xp} XP**, **+${coins} coins** — ${lootText}`);
+
+      lines.push(`• <@${uid}>: **+${xp} XP**, **+${coins} coins** — ${lootLines.join(', ')}`);
     } else {
       const coins = R(30, 70);
+      const cons = randomConsumable();
       u.coins += coins;
-      lines.push(`• <@${uid}>: **+${coins} coins** (consolation)`);
+      u.inventory.push(cons.name);
+      lines.push(`• <@${uid}>: **+${coins} coins**, **${cons.name}** (consolation)`);
     }
   }
   saveSoon();
@@ -561,20 +575,28 @@ function endRaid(channel, success){
       const coins = R(600, 1200);
       const xp    = R(800, 1600);
       u.coins += coins; u.xp += xp;
-      const lvl = levelFromXp(u.xp);
-      const pool = filterGearByTier(store.shop.items, lvl);
-      let lootText = 'No gear this time.';
-      if (pool.length && Math.random() < 0.25) {
-        const item = pool[R(0,pool.length-1)];
+
+      // Guaranteed consumable + gacha
+      const lootLines = [];
+      const guaranteed = randomConsumable();
+      u.inventory.push(guaranteed.name);
+      lootLines.push(`**${guaranteed.name}** (consumable)`);
+
+      const extra = rollGachaRaid(levelFromXp(u.xp));
+      if (extra) {
+        const { kind, item } = extra;
         u.inventory.push(item.name);
-        lootText = `**${item.name}** (T${item.tier})`;
-        showcaseItem(channel, uid, item.name, '🏰 Raid Loot');
+        lootLines.push(`**${item.name}** (${kind})`);
+        if (kind==='gear') showcaseItem(channel, uid, item.name, '🏰 Raid Loot');
       }
-      lines.push(`• <@${uid}>: +${xp} XP, +${coins} coins — ${lootText}`);
+
+      lines.push(`• <@${uid}>: +${xp} XP, +${coins} coins — ${lootLines.join(', ')}`);
     } else {
       const coins = R(120, 260);
+      const cons = randomConsumable();
       u.coins += coins;
-      lines.push(`• <@${uid}>: +${coins} coins (consolation)`);
+      u.inventory.push(cons.name);
+      lines.push(`• <@${uid}>: +${coins} coins, **${cons.name}** (consolation)`);
     }
   }
   saveSoon();
@@ -614,6 +636,91 @@ async function showcaseItem(channel, userId, itemName, title='🎁 New Item'){
   if (url) emb.setImage(url);
   channel.send({ embeds:[emb] }).catch(()=>{});
 }
+
+/* ---------------- Gacha helpers ---------------- */
+function itemsByTier(maxTier){
+  const map = {};
+  for (let t=1;t<=maxTier;t++) map[t] = [];
+  for (const it of store.shop.items){
+    if ((it.type==='weapon'||it.type==='armor') && it.tier && it.tier<=maxTier){
+      map[it.tier].push(it);
+    }
+  }
+  return map;
+}
+function weightedTierPick(maxTier){
+  // Lower tiers more likely: weight = (maxTier - tier + 1)
+  const weights = [];
+  let total = 0;
+  for (let t=1; t<=maxTier; t++){
+    const w = (maxTier - t + 1);
+    weights.push({t, w}); total += w;
+  }
+  let r = Math.random() * total;
+  for (const {t,w} of weights){
+    if (r < w) return t;
+    r -= w;
+  }
+  return maxTier;
+}
+function randomConsumable(){
+  const pool = store.shop.items.filter(i=>i.type==='consumable');
+  return pool.length ? pool[R(0,pool.length-1)] : { name:'Energy Drink', type:'consumable', effect:'+10% XP next log', price:0 };
+}
+function rollGearUpToTier(maxTier){
+  const by = itemsByTier(maxTier);
+  // pick a tier with descending weights
+  const t = weightedTierPick(maxTier);
+  const list = by[t] || [];
+  if (!list.length) return null;
+  return list[R(0, list.length-1)];
+}
+// Adventure: always coins/XP + one extra roll.
+// Distribution (extra): 20% gear (tier-weighted), 2.5% trinket, 5% pet/mount, ~18% nothing, rest consumable.
+function rollGachaAdventure(lvl){
+  const cap = maxTierForLevel(lvl);
+  const r = Math.random();
+  if (r < 0.18) return null; // nothing
+  if (r < 0.38) { // 0.20 range
+    const item = rollGearUpToTier(cap);
+    return item ? { kind:'gear', item } : null;
+  }
+  if (r < 0.405) { // +0.025
+    const pool = store.shop.items.filter(i=>i.type==='trinket' && (i.tier||1)<=cap);
+    if (!pool.length) return null;
+    return { kind:'trinket', item: pool[R(0,pool.length-1)] };
+  }
+  if (r < 0.455) { // +0.05
+    const pool = store.shop.items.filter(i=> (i.type==='pet'||i.type==='mount') && (i.tier||1)<=cap);
+    if (!pool.length) return null;
+    return { kind: (pool[0]?.type)||'pet', item: pool[R(0,pool.length-1)] };
+  }
+  // otherwise consumable
+  return { kind:'consumable', item: randomConsumable() };
+}
+// Hunt: guaranteed ≥1 consumable, then one extra roll (same gear/trinket/pet rates; no “nothing”)
+function rollGachaHunt(lvl){
+  const cap = maxTierForLevel(lvl);
+  const r = Math.random();
+  if (r < 0.20) { // gear 20%
+    const item = rollGearUpToTier(cap);
+    return item ? { kind:'gear', item } : null;
+  }
+  if (r < 0.225) { // +2.5% trinket
+    const pool = store.shop.items.filter(i=>i.type==='trinket' && (i.tier||1)<=cap);
+    if (!pool.length) return null;
+    return { kind:'trinket', item: pool[R(0,pool.length-1)] };
+  }
+  if (r < 0.275) { // +5% pet/mount
+    const pool = store.shop.items.filter(i=> (i.type==='pet'||i.type==='mount') && (i.tier||1)<=cap);
+    if (!pool.length) return null;
+    return { kind: (pool[0]?.type)||'pet', item: pool[R(0,pool.length-1)] };
+  }
+  // else: additional consumable
+  return { kind:'consumable', item: randomConsumable() };
+}
+// Raid: same as hunt (guaranteed ≥1 consumable + one extra)
+const rollGachaRaid = rollGachaHunt;
 
 /* ---------------- Commands ---------------- */
 const commands = [
@@ -728,18 +835,6 @@ async function applyLevelRole(member, lvl){
     await member.roles.add(role);
   } catch(e){ console.warn('Role apply failed', e); }
 }
-async function sendLevelUp(member, newLevel){
-  const channelId = store.config.levelUpChannelId || LEVELUP_CHANNEL_ID;
-  const ch = channelId ? await member.client.channels.fetch(channelId).catch(()=>null) : member.guild.systemChannel;
-  const emb = new EmbedBuilder()
-    .setTitle(`🎉✨ LEVEL UP! ✨🎉`)
-    .setColor(0xf1c40f)
-    .setDescription(`**${member.user.username}** reached **Level ${newLevel}**!`)
-    .setThumbnail(member.user.displayAvatarURL());
-  if (ch) ch.send({ embeds:[emb] }).catch(()=>{});
-}
-
-/* ---------------- XP bar builder ---------------- */
 function xpBar(user){
   const lvl = levelFromXp(user.xp);
   const need = xpForLevel(lvl+1);
@@ -748,8 +843,26 @@ function xpBar(user){
   const filled = Math.round(barLen*pct);
   return { lvl, need, prog, bar: '█'.repeat(filled) + '░'.repeat(barLen-filled), pct: Math.round(pct*100) };
 }
+async function sendLevelUp(member, newLevel){
+  const channelId = store.config.levelUpChannelId || LEVELUP_CHANNEL_ID;
+  const ch = channelId ? await member.client.channels.fetch(channelId).catch(()=>null) : member.guild.systemChannel;
+  const dummyUser = ensureUser(member.id);
+  const bar = xpBar(dummyUser);
+  const emb = new EmbedBuilder()
+    .setTitle('🎉✨ LEVEL UP! ✨🎉')
+    .setColor(0xf1c40f)
+    .setDescription([
+      `**${member.user.username}** reached **Level ${newLevel}**!`,
+      '',
+      `Progress to ${newLevel+1}: ${bar.prog}/${bar.need} (${bar.pct}%)`,
+      `${bar.bar}`
+    ].join('\n'))
+    .setThumbnail(member.user.displayAvatarURL())
+    .setImage(LEVELUP_GIF);
+  if (ch) ch.send({ embeds:[emb] }).catch(()=>{});
+}
 
-/* ---------------- Workout log & XP (with bar + raid auto-update) ---------------- */
+/* ---------------- Workout log & XP (with bar + raid/hunt auto-update) ---------------- */
 function computeXp(type, amount, user){
   const cfg = BUILT_INS[type];
   if (!cfg) return 0;
@@ -767,11 +880,12 @@ async function doWorkoutLog(interaction, type, amount){
   const now = Date.now();
   if (now - user.lastLog < (store.config.logCooldownSec||10)*1000){
     const wait = Math.ceil((((store.config.logCooldownSec||10)*1000)-(now-user.lastLog))/1000);
-    return interaction.reply({ content:`⏳ Log cooldown. Try again in ${wait}s.`, ephemeral:true });
+    await interaction.editReply({ content:`⏳ Log cooldown. Try again in ${wait}s.` });
+    return;
   }
   const cfg = BUILT_INS[type];
-  if (!cfg) return interaction.reply({ content:'❌ Unsupported exercise.', ephemeral:true });
-  if (amount<=0) return interaction.reply({ content:'❌ Amount must be positive.', ephemeral:true });
+  if (!cfg){ await interaction.editReply({ content:'❌ Unsupported exercise.' }); return; }
+  if (amount<=0){ await interaction.editReply({ content:'❌ Amount must be positive.' }); return; }
 
   const xpGain = computeXp(type, amount, user);
   const preLevel = levelFromXp(user.xp);
@@ -781,6 +895,7 @@ async function doWorkoutLog(interaction, type, amount){
   user.tokens += 1; // 1 token per log
   user.lastLog = now;
   user.lastActiveISO = todayISO();
+  addDailyLog(user, type, amount);
 
   // Hunt contribution
   try {
@@ -830,7 +945,7 @@ async function doWorkoutLog(interaction, type, amount){
 
   saveSoon();
 
-  // XP bar reply (always visible)
+  // XP bar reply
   const bar = xpBar(user);
   const emb = new EmbedBuilder()
     .setTitle('✅ Workout logged!')
@@ -843,7 +958,7 @@ async function doWorkoutLog(interaction, type, amount){
       `${bar.bar}`
     ].join('\n'))
     .setThumbnail(interaction.user.displayAvatarURL());
-  await interaction.reply({ embeds:[emb] });
+  await interaction.editReply({ embeds:[emb] });
 
   // Flashy level-up (separate message in level-up channel)
   const newLevel = levelFromXp(user.xp);
@@ -874,53 +989,77 @@ async function doAdventure(interaction){
   const now = Date.now();
   if (now - u.lastAdventure < (store.config.huntCooldownSec||20)*1000){
     const wait = Math.ceil((((store.config.huntCooldownSec||20)*1000)-(now-u.lastAdventure))/1000);
-    return interaction.reply({ content:`⏳ Adventure cooldown. Try again in ${wait}s.`, ephemeral:true });
+    await interaction.editReply({ content:`⏳ Adventure cooldown. Try again in ${wait}s.` });
+    return;
   }
-  if ((u.tokens||0) <= 0) return interaction.reply({ content:'⚠️ You need 1 token. Log a workout to earn tokens.', ephemeral:true });
+  if ((u.tokens||0) <= 0){ await interaction.editReply({ content:'⚠️ You need 1 token. Log a workout to earn tokens.' }); return; }
 
   u.tokens -= 1;
   u.lastAdventure = now;
 
-  // modest xp/coin, chance at tier-gated gear
+  // baseline xp/coin
   const xp = R(80,140);
   const coins = R(90,160);
   u.xp += xp; u.coins += coins;
-  const lvl = levelFromXp(u.xp);
-  const pool = filterGearByTier(store.shop.items, lvl);
-  let loot = null;
-  if (pool.length && Math.random() < 0.25) {
-    loot = pool[R(0,pool.length-1)];
-    u.inventory.push(loot.name);
+
+  // extra roll (gacha rules)
+  const extra = rollGachaAdventure(levelFromXp(u.xp));
+  let lootLine = 'No extra loot.';
+  if (extra){
+    const { kind, item } = extra;
+    u.inventory.push(item.name);
+    lootLine = `Loot: **${item.name}** (${kind})`;
+    if (kind==='gear') showcaseItem(interaction.channel, interaction.user.id, item.name, '🧭 Adventure Loot');
   }
   saveSoon();
 
-  const lines = [`**Adventure complete!** +${xp} XP, +${coins} coins`];
-  if (loot){
-    lines.push(`Loot: **${loot.name}** (T${loot.tier})`);
-  } else {
-    lines.push(`No gear this time. Use a **Treasure Map** to guarantee loot.`);
-  }
-
-  const url = loot ? artURL(loot.name) : null;
-  const emb = new EmbedBuilder().setTitle('🧭 Adventure').setColor(0x2ecc71).setDescription(lines.join('\n'));
+  const url = extra ? artURL(extra.item.name) : null;
+  const emb = new EmbedBuilder()
+    .setTitle('🧭 Adventure')
+    .setColor(0x2ecc71)
+    .setDescription([`**Adventure complete!** +${xp} XP, +${coins} coins`, lootLine].join('\n'));
   if (url) emb.setImage(url);
 
-  return interaction.reply({ embeds:[emb] });
+  await interaction.editReply({ embeds:[emb] });
 }
 
 /* ---------------- Interactions ---------------- */
 client.on('interactionCreate', async (interaction) => {
   try {
+    // Shop pagination buttons
+    if (interaction.isButton() && interaction.customId.startsWith('shop:')) {
+      const parts = interaction.customId.split(':'); // ['shop','prev|next', currentPage]
+      const dir = parts[1];
+      const cur = parseInt(parts[2]||'1',10);
+      const newPage = dir==='prev' ? Math.max(1, cur-1) : cur+1;
+
+      const { emb, page, totalPages } = shopEmbed(newPage);
+      const prev = new ButtonBuilder().setCustomId(`shop:prev:${page}`).setLabel('Prev').setStyle(ButtonStyle.Secondary).setDisabled(page<=1);
+      const next = new ButtonBuilder().setCustomId(`shop:next:${page}`).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(page>=totalPages);
+      const row = new ActionRowBuilder().addComponents(prev, next);
+      return interaction.update({ embeds:[emb], components:[row] });
+    }
+
     if (interaction.isChatInputCommand()){
       const user = ensureUser(interaction.user.id);
+
+      // Helper to defer replies (ephemeral per-command)
+      async function ensureDeferred(ephemeral=false){
+        if (!interaction.deferred && !interaction.replied){
+          await interaction.deferReply({ ephemeral });
+        }
+      }
+
       switch (interaction.commandName){
 
         case 'ping': {
-          await interaction.reply({ content:'🏓 Pong!' });
+          await ensureDeferred(false);
+          await interaction.editReply({ content:'🏓 Pong!' });
           return;
         }
 
         case 'help': {
+          await ensureDeferred(true);
           const emb = new EmbedBuilder()
             .setTitle('📖 FitRPG Help')
             .setColor(0x95a5a6)
@@ -933,14 +1072,15 @@ client.on('interactionCreate', async (interaction) => {
               '**Hunts:** `/hunt create size:<1–5> exercise:<type>` → `/hunt join` → log matching exercise *in this channel*',
               '**Raids:** `/raid create exercise:<type> [hours] [hp] [name]` → logs auto-update the raid message',
               '**Adventure:** `/adventure` (spend 1 token for loot & XP)',
-              '**Daily:** `/daily show` → `/daily claim`',
-              '**Bounty:** `/bounty show` → `/bounty claim`',
+              '**Daily:** `/daily show` → `/daily claim` (must log tasks first)',
+              '**Bounty:** `/bounty show` → `/bounty claim` (must log tasks first)',
               '**Art:** `/setart key:"Item or Boss Name" image:<upload>`'
             ].join('\n'));
-          return interaction.reply({ embeds:[emb], ephemeral:true });
+          return interaction.editReply({ embeds:[emb] });
         }
 
         case 'profile': {
+          await ensureDeferred(false);
           const bar = xpBar(user);
           const emb = new EmbedBuilder()
             .setTitle(`🧑‍🚀 ${interaction.user.username}`)
@@ -954,182 +1094,213 @@ client.on('interactionCreate', async (interaction) => {
               `Pet: ${user.equipped.pet||'—'} • Mount: ${user.equipped.mount||'—'}`
             ].join('\n'))
             .setThumbnail(interaction.user.displayAvatarURL());
-          return interaction.reply({ embeds:[emb] });
+          return interaction.editReply({ embeds:[emb] });
         }
 
         case 'inventory': {
+          await ensureDeferred(true);
           const inv = user.inventory.length ? user.inventory.join(', ') : '—';
           const emb = new EmbedBuilder().setTitle('🎒 Inventory').setColor(0x7289da).setDescription(inv);
-          return interaction.reply({ embeds:[emb], ephemeral:true });
+          return interaction.editReply({ embeds:[emb] });
         }
 
         case 'log': {
+          await ensureDeferred(false);
           const type = interaction.options.getString('type');
           const amount = interaction.options.getInteger('amount');
           return doWorkoutLog(interaction, type, amount);
         }
 
         case 'p': {
+          await ensureDeferred(false);
           const amount = interaction.options.getInteger('amount');
           return doWorkoutLog(interaction, 'pushups', amount);
         }
 
         case 'plank': {
+          await ensureDeferred(false);
           const amount = interaction.options.getInteger('amount');
           return doWorkoutLog(interaction, 'plank', amount);
         }
 
         case 'run': {
+          await ensureDeferred(false);
           const miles = interaction.options.getNumber('miles');
           return doWorkoutLog(interaction, 'run_miles', Math.round(miles));
         }
 
         case 'shop': {
+          await ensureDeferred(false);
           const reqPage = interaction.options.getInteger('page') || 1;
           const { emb, page, totalPages } = shopEmbed(reqPage);
           const prev = new ButtonBuilder().setCustomId(`shop:prev:${page}`).setLabel('Prev').setStyle(ButtonStyle.Secondary).setDisabled(page<=1);
           const next = new ButtonBuilder().setCustomId(`shop:next:${page}`).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(page>=totalPages);
           const row = new ActionRowBuilder().addComponents(prev, next);
-          return interaction.reply({ embeds:[emb], components:[row] });
+          return interaction.editReply({ embeds:[emb], components:[row] });
         }
 
         case 'buy': {
+          await ensureDeferred(false);
           const name = interaction.options.getString('item');
           const item = store.shop.items.find(i=>i.name.toLowerCase()===name.toLowerCase());
-          if (!item) return interaction.reply({ content:'❌ Item not found.', ephemeral:true });
-          if (user.coins < item.price) return interaction.reply({ content:`❌ Need ${item.price} coins.`, ephemeral:true });
+          if (!item) return interaction.editReply({ content:'❌ Item not found.' });
+          if (user.coins < item.price) return interaction.editReply({ content:`❌ Need ${item.price} coins.` });
           if ((item.type==='weapon'||item.type==='armor')){
             const lvl = levelFromXp(user.xp);
             if ((item.tier||1) > maxTierForLevel(lvl)){
-              return interaction.reply({ content:`❌ Tier too high. Need higher level for **T${item.tier}**.`, ephemeral:true });
+              return interaction.editReply({ content:`❌ Tier too high. Need higher level for **T${item.tier}**.` });
             }
           }
           user.coins -= item.price; user.inventory.push(item.name); saveSoon();
+          // Reply first (prevents timeout), then showcase
+          await interaction.editReply({ content:`🛍️ Purchased **${item.name}**!` });
           showcaseItem(interaction.channel, interaction.user.id, item.name, '🛍️ Purchase');
           return;
         }
 
         case 'equip': {
+          await ensureDeferred(false);
           const name = interaction.options.getString('item');
-          if (!user.inventory.includes(name)) return interaction.reply({ content:'❌ You do not own that item.', ephemeral:true });
+          if (!user.inventory.includes(name)) return interaction.editReply({ content:'❌ You do not own that item.' });
           const item = store.shop.items.find(i=>i.name===name);
-          if (!item || !['weapon','armor','trinket'].includes(item.type)) return interaction.reply({ content:'❌ Not equippable as gear.', ephemeral:true });
+          if (!item || !['weapon','armor','trinket'].includes(item.type)) return interaction.editReply({ content:'❌ Not equippable as gear.' });
           user.equipped[item.type] = name; saveSoon();
 
           const url = artURL(item.name);
           const emb = new EmbedBuilder().setTitle('🛡️ Equipped').setColor(0x00c2ff)
             .setDescription(`You equipped **${item.name}**${item.tier?` (T${item.tier})`:''}.`);
           if (url) emb.setImage(url);
-          return interaction.reply({ embeds:[emb] });
+          return interaction.editReply({ embeds:[emb] });
         }
 
         case 'summonpet': {
+          await ensureDeferred(false);
           const name = interaction.options.getString('item');
-          if(!user.inventory.includes(name)) return interaction.reply({ content:'❌ You don’t own that pet.', ephemeral:true });
+          if(!user.inventory.includes(name)) return interaction.editReply({ content:'❌ You don’t own that pet.' });
           const item = store.shop.items.find(i=>i.name===name);
-          if (!item || item.type!=='pet') return interaction.reply({ content:'❌ That’s not a pet.', ephemeral:true });
+          if (!item || item.type!=='pet') return interaction.editReply({ content:'❌ That’s not a pet.' });
           user.equipped.pet = name; saveSoon();
           const url = artURL(name);
           const emb = new EmbedBuilder().setTitle('🐾 Pet equipped!').setColor(0x00c2ff).setDescription(`**${name}** is now active!`);
           if (url) emb.setImage(url);
-          return interaction.reply({ embeds:[emb] });
+          return interaction.editReply({ embeds:[emb] });
         }
 
         case 'equipmount': {
+          await ensureDeferred(false);
           const name = interaction.options.getString('item');
-          if(!user.inventory.includes(name)) return interaction.reply({ content:'❌ You don’t own that mount.', ephemeral:true });
+          if(!user.inventory.includes(name)) return interaction.editReply({ content:'❌ You don’t own that mount.' });
           const item = store.shop.items.find(i=>i.name===name);
-          if (!item || item.type!=='mount') return interaction.reply({ content:'❌ That’s not a mount.', ephemeral:true });
+          if (!item || item.type!=='mount') return interaction.editReply({ content:'❌ That’s not a mount.' });
           user.equipped.mount = name; saveSoon();
           const url = artURL(name);
           const emb = new EmbedBuilder().setTitle('🐎 Mount equipped!').setColor(0x00c2ff).setDescription(`**${name}** saddled up!`);
           if (url) emb.setImage(url);
-          return interaction.reply({ embeds:[emb] });
+          return interaction.editReply({ embeds:[emb] });
         }
 
         case 'setart': {
-          if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({ content:'Admin only.', ephemeral:true });
+          await ensureDeferred(true);
+          if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.editReply({ content:'Admin only.' });
           const key = interaction.options.getString('key');
           const att = interaction.options.getAttachment('image');
-          if (!att?.url) return interaction.reply({ content:'No image URL.', ephemeral:true });
+          if (!att?.url) return interaction.editReply({ content:'No image URL.' });
           store.artMap[key] = att.url;
           store.artMap[key.toLowerCase()] = att.url;
           store.artMap[key.replace(/\s+/g,'_').toLowerCase()] = att.url;
           saveSoon();
-          return interaction.reply(`✅ Art set for **${key}**`);
+          return interaction.editReply(`✅ Art set for **${key}**`);
         }
 
         case 'daily': {
           const sub = interaction.options.getSubcommand();
-          const d = ensureDaily();
-          if (sub==='show') return interaction.reply({ embeds:[dailyEmbed()] });
+          if (sub==='show'){
+            await ensureDeferred(false);
+            return interaction.editReply({ embeds:[dailyEmbed()] });
+          }
           if (sub==='claim'){
-            if (user.dailyProgress[`daily_${d.date}`]) return interaction.reply({ content:'✅ Already claimed today.', ephemeral:true });
+            await ensureDeferred(false);
+            const d = ensureDaily();
+            if (user.dailyProgress[`daily_${d.date}`]) return interaction.editReply({ content:'✅ Already claimed today.' });
+            if (!hasMetTasks(user, d.tasks)) return interaction.editReply({ content:'❌ You must log the daily tasks first.' });
             const totalXp = d.tasks.reduce((a,t)=>a+t.xp,0);
             const totalCoins = d.tasks.reduce((a,t)=>a+t.coins,0);
             user.xp += totalXp; user.coins += totalCoins;
             user.dailyProgress[`daily_${d.date}`] = true; saveSoon();
-            return interaction.reply(`📆 Daily complete! +${totalXp} XP, +${totalCoins} coins`);
+            return interaction.editReply(`📆 Daily complete! +${totalXp} XP, +${totalCoins} coins`);
           }
-          break;
+          return;
         }
 
         case 'bounty': {
           const sub = interaction.options.getSubcommand();
-          const b = ensureDailyBounty();
-          if (sub==='show') return interaction.reply({ embeds:[bountyEmbed()] });
+          if (sub==='show'){
+            await ensureDeferred(false);
+            return interaction.editReply({ embeds:[bountyEmbed()] });
+          }
           if (sub==='claim'){
-            if (user.dailyProgress[`bounty_${b.date}`]) return interaction.reply({ content:'✅ Already claimed today.', ephemeral:true });
+            await ensureDeferred(false);
+            const b = ensureDailyBounty();
+            if (user.dailyProgress[`bounty_${b.date}`]) return interaction.editReply({ content:'✅ Already claimed today.' });
+            if (!hasMetTasks(user, b.tasks.map(t=>({ type:t.type, target:t.target })))) return interaction.editReply({ content:'❌ You must log the bounty tasks first.' });
             const xp = b.tasks.reduce((a,t)=>a+t.rewardXp,0);
             const coins = b.tasks.reduce((a,t)=>a+t.rewardCoins,0);
             user.xp += xp; user.coins += coins;
             user.dailyProgress[`bounty_${b.date}`] = true; saveSoon();
-            return interaction.reply(`🎯 Bounty complete! +${xp} XP, +${coins} coins`);
+            return interaction.editReply(`🎯 Bounty complete! +${xp} XP, +${coins} coins`);
           }
-          break;
+          return;
         }
 
         case 'hunt': {
           const sub = interaction.options.getSubcommand();
           const ch = interaction.channel;
           if (sub==='create'){
+            await ensureDeferred(false);
+            if (getActiveHunt(ch.id)) return interaction.editReply({ content:'⚠️ A hunt is already active here.' });
             const size = interaction.options.getInteger('size');
             const exercise = interaction.options.getString('exercise');
-            if (getActiveHunt(ch.id)) return interaction.reply({ content:'⚠️ A hunt is already active here.', ephemeral:true });
             openHunt(ch.id, size, exercise, interaction.user.id);
             saveSoon();
-            return interaction.reply({ embeds:[huntStatusEmbed(ch)] });
+            return interaction.editReply({ embeds:[huntStatusEmbed(ch)] });
           }
           if (sub==='join'){
+            await ensureDeferred(false);
             const h = getActiveHunt(ch.id);
-            if (!h) return interaction.reply({ content:'❌ No active hunt in this channel. Use `/hunt create`.', ephemeral:true });
-            if ((user.tokens||0) <= 0) return interaction.reply({ content:'⚠️ You need 1 token to join. Log a workout to earn tokens.', ephemeral:true });
+            if (!h) return interaction.editReply({ content:'❌ No active hunt in this channel. Use `/hunt create`.' });
+            if ((user.tokens||0) <= 0) return interaction.editReply({ content:'⚠️ You need 1 token to join. Log a workout to earn tokens.' });
             const { error, joined } = joinHunt(ch.id, interaction.user.id);
-            if (error) return interaction.reply({ content:`❌ ${error}`, ephemeral:true });
+            if (error) return interaction.editReply({ content:`❌ ${error}` });
             if (joined) { user.tokens -= 1; saveSoon(); }
-            return interaction.reply({ embeds:[huntStatusEmbed(ch)] });
+            return interaction.editReply({ embeds:[huntStatusEmbed(ch)] });
           }
-          if (sub==='status') return interaction.reply({ embeds:[huntStatusEmbed(interaction.channel)] });
+          if (sub==='status'){
+            await ensureDeferred(true);
+            return interaction.editReply({ embeds:[huntStatusEmbed(interaction.channel)] });
+          }
           if (sub==='leave'){
+            await ensureDeferred(true);
             const { error } = leaveHunt(ch.id, interaction.user.id);
-            if (error) return interaction.reply({ content:`❌ ${error}`, ephemeral:true });
-            return interaction.reply({ content:'✅ You left the hunt.' });
+            if (error) return interaction.editReply({ content:`❌ ${error}` });
+            return interaction.editReply({ content:'✅ You left the hunt.' });
           }
           if (sub==='cancel'){
-            if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({ content:'Admin only.', ephemeral:true });
-            if (!getActiveHunt(ch.id)) return interaction.reply({ content:'No active hunt.', ephemeral:true });
+            await ensureDeferred(true);
+            if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.editReply({ content:'Admin only.' });
+            if (!getActiveHunt(ch.id)) return interaction.editReply({ content:'No active hunt.' });
             delete store.hunts[ch.id]; saveSoon();
-            return interaction.reply('🛑 Hunt cancelled.');
+            return interaction.editReply('🛑 Hunt cancelled.');
           }
-          break;
+          return;
         }
 
         case 'raid': {
           const sub = interaction.options.getSubcommand();
           const ch = interaction.channel;
           if (sub==='create'){
-            if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({ content:'Admin only.', ephemeral:true });
-            if (store.raids[ch.id]) return interaction.reply({ content:'⚠️ A raid is already active here.', ephemeral:true });
+            await ensureDeferred(false);
+            if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.editReply({ content:'Admin only.' });
+            if (store.raids[ch.id]) return interaction.editReply({ content:'⚠️ A raid is already active here.' });
             const exercise = interaction.options.getString('exercise');
             const hp = interaction.options.getInteger('hp') || bossHpDefault(exercise);
             const hours = interaction.options.getInteger('hours') || 24;
@@ -1147,48 +1318,40 @@ client.on('interactionCreate', async (interaction) => {
               messageId:null
             };
             saveSoon();
-            await interaction.reply({ content:'🛡️ Raid started! Posting status…' });
+            await interaction.editReply({ content:'🛡️ Raid started! Posting status…' });
             await postOrUpdateRaidMessage(ch);
             return;
           }
           if (sub==='status') {
+            await ensureDeferred(true);
             await postOrUpdateRaidMessage(ch);
-            return interaction.reply({ content:'📡 Raid status updated.', ephemeral:true });
+            return interaction.editReply({ content:'📡 Raid status updated.' });
           }
           if (sub==='cancel'){
-            if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({ content:'Admin only.', ephemeral:true });
-            if (!store.raids[ch.id]) return interaction.reply({ content:'No active raid.', ephemeral:true });
+            await ensureDeferred(true);
+            if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.editReply({ content:'Admin only.' });
+            if (!store.raids[ch.id]) return interaction.editReply({ content:'No active raid.' });
             delete store.raids[ch.id]; saveSoon();
-            return interaction.reply('🛑 Raid cancelled.');
+            return interaction.editReply('🛑 Raid cancelled.');
           }
-          break;
+          return;
         }
 
         case 'adventure': {
+          await ensureDeferred(false);
           return doAdventure(interaction);
         }
 
         default: return;
       }
     }
-
-    // Shop pagination buttons
-    if (interaction.isButton() && interaction.customId.startsWith('shop:')) {
-      const parts = interaction.customId.split(':'); // ['shop','prev|next', currentPage]
-      const dir = parts[1];
-      const cur = parseInt(parts[2]||'1',10);
-      const newPage = dir==='prev' ? Math.max(1, cur-1) : cur+1;
-
-      const { emb, page, totalPages } = shopEmbed(newPage);
-      const prev = new ButtonBuilder().setCustomId(`shop:prev:${page}`).setLabel('Prev').setStyle(ButtonStyle.Secondary).setDisabled(page<=1);
-      const next = new ButtonBuilder().setCustomId(`shop:next:${page}`).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(page>=totalPages);
-      const row = new ActionRowBuilder().addComponents(prev, next);
-      return interaction.update({ embeds:[emb], components:[row] });
-    }
   } catch (err){
     console.error('INTERACTION_ERROR', err);
     if (interaction.isRepliable()) {
-      try { await interaction.reply({ content:'⚠️ Something went wrong.', ephemeral:true }); } catch {}
+      try {
+        if (!interaction.deferred && !interaction.replied) await interaction.deferReply({ ephemeral:true });
+        await interaction.editReply({ content:'⚠️ Something went wrong.' });
+      } catch {}
     }
   }
 });
