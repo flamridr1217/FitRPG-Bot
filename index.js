@@ -876,5 +876,4 @@ async function doWorkoutLog(interaction, type, amount){
     if (r && !r.done && Date.now() < r.deadline && r.hp > 0) {
       let dmg = 0;
       switch(r.exercise){
-
 [Message clipped]  View entire message
