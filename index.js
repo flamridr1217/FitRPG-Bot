@@ -1,10 +1,6 @@
-// FitRPG Bot — All-in-One (Mobile-first + Themeable Hunts/Raids + Art on Loot/Equip)
+// FitRPG Bot — Mobile-first RPG (Images-only art, easy XP, raids auto-update, hunts 1–5, inventory & adventure)
 // CommonJS + discord.js v14
-// Notes:
-// - Art: use /setart to attach PNGs/URLs to any item/monster/pet/mount key; ASCII fallback included.
-// - Persistence: prefers MongoDB when MONGO_URI is set; else JSON file (data.json).
-// - Daily auto-post: 00:01 America/Chicago to DAILY_CHANNEL_ID or configured channel.
-// - Health server on PORT (Render) to keep the dyno alive.
+// IMPORTANT: add package.json with Node 20 + type: commonjs (see bottom of this message).
 
 const {
   Client, GatewayIntentBits,
@@ -16,13 +12,25 @@ const {
 } = require('discord.js');
 const fs = require('fs');
 const http = require('http');
+const https = require('https');
 
-/* ---------------- Health server for Render ---------------- */
+/* ---------------- Health server (keeps Render alive) ---------------- */
 const PORT = process.env.PORT || 10000;
 http.createServer((_, res) => {
   res.writeHead(200, {'Content-Type':'text/plain'});
   res.end('FitRPG bot is running.\n');
 }).listen(PORT, () => console.log(`Health server listening on port ${PORT}`));
+
+/* Optional self-ping */
+const KEEPALIVE_URL = process.env.KEEPALIVE_URL || process.env.RENDER_EXTERNAL_URL || null;
+if (KEEPALIVE_URL) {
+  setInterval(() => {
+    try {
+      const lib = KEEPALIVE_URL.startsWith('https') ? https : http;
+      lib.get(KEEPALIVE_URL, () => {}).on('error', ()=>{});
+    } catch {}
+  }, 4 * 60 * 1000);
+}
 
 /* ---------------- ENV ---------------- */
 const token    = process.env.DISCORD_TOKEN;
@@ -52,7 +60,7 @@ let store = {
   users: {},           // id -> user state
   shop: { items: [] }, // static items; we build defaults if empty
   events: [],
-  raids: {},           // channelId -> raid object
+  raids: {},           // channelId -> { ... , messageId }
   hunts: {},           // channelId -> hunt object
   bounties: { dailyKey: null, daily: null },
   artMap: {},          // key -> image url for items/monsters/pets/mounts
@@ -63,7 +71,7 @@ let store = {
     dailyChannelId: DAILY_CHANNEL_ID,
     logCooldownSec: 10,
     raidHitCooldownSec: 8,
-    huntCooldownSec: 30,
+    huntCooldownSec: 20,
     huntDurationMin: 60,
     dailyPost: { hour: 0, minute: 1, tz: 'America/Chicago' } // 00:01 CT
   }
@@ -74,7 +82,7 @@ function ensureUser(id){
     xp:0, coins:0, tokens:0,
     inventory:[],
     equipped:{weapon:null,armor:null,trinket:null,cosmetic:null, pet:null, mount:null},
-    lastLog:0, lastRaidHit:0, lastHunt:0,
+    lastLog:0, lastRaidHit:0, lastHunt:0, lastAdventure:0,
     lastActiveISO:null, streak:0,
     dailyProgress:{},
     _buffs:{},
@@ -104,7 +112,7 @@ async function saveStore(){
   }
 }
 let saveTimer=null;
-function saveSoon(){ clearTimeout(saveTimer); saveTimer=setTimeout(()=>saveStore().catch(console.error), 500); }
+function saveSoon(){ clearTimeout(saveTimer); saveTimer=setTimeout(()=>saveStore().catch(console.error), 400); }
 
 /* ---------------- Utils ---------------- */
 function R(min,max){ return Math.floor(Math.random()*(max-min+1))+min; }
@@ -112,11 +120,17 @@ function clamp(n,lo,hi){ return Math.max(lo, Math.min(hi, n)); }
 function todayISO(){ return new Date().toISOString().slice(0,10); }
 function getNowInTZ(tz) { return new Date(new Date().toLocaleString('en-US', { timeZone: tz })); }
 
-/* ---------------- XP / Level model (smooth to 1000) ---------------- */
+/* ---------------- XP / Level (reverted easier model) ---------------- */
+/* Per your earlier preference:
+   - Running: 40 XP per mile
+   - Pushups: 0.50 XP / rep
+   - Plank:   0.20 XP / sec
+   + Similar for other moves
+   Level curve: smooth, fast early, still scales to 1000. */
 function xpForLevel(level){
-  if (level <= 1) return 100; // faster start
-  const base = 60;
-  return Math.floor(base * Math.pow(level, 1.15) + 40);
+  if (level <= 1) return 80;
+  const base = 45;                 // lower than before (easier)
+  return Math.floor(base * Math.pow(level, 1.08) + 30);
 }
 function totalXpForLevel(level){
   let t=0; for (let i=1;i<=level;i++) t += xpForLevel(i); return t;
@@ -132,29 +146,21 @@ function levelFromXp(xp){
   return lvl;
 }
 
-/* ---------------- Exercises & XP rates (mobile-friendly) ---------------- */
+/* ---------------- Exercises & XP rates (reverted) ---------------- */
 const BUILT_INS = {
-  pushups:{ unit:'reps', rate:0.55 },
-  situps:{ unit:'reps', rate:0.45 },
-  squats:{ unit:'reps', rate:0.45 },
-  pullups:{ unit:'reps', rate:2.2 },
-  burpees:{ unit:'reps', rate:1.2 },
-  dips:{ unit:'reps', rate:1.6 },
-  plank:{ unit:'seconds', rate:0.22 },
-  run_miles:{ unit:'miles', rate:40 },
-  run:{ unit:'minutes', rate:0.35 },
-  cycle_miles:{ unit:'miles', rate:14 },
-  row_minutes:{ unit:'minutes', rate:0.45 },
-  swim_laps:{ unit:'laps', rate:20 },
-  bench:{ unit:'reps', rate:1.2 },
-  legpress:{ unit:'reps', rate:1.2 },
-  deadlift:{ unit:'reps', rate:1.4 },
-  squat_barbell:{ unit:'reps', rate:1.4 },
-  ohp:{ unit:'reps', rate:1.1 },
+  // bodyweight
+  pushups:{ unit:'reps', rate:0.50 }, situps:{ unit:'reps', rate:0.40 }, squats:{ unit:'reps', rate:0.40 },
+  lunges:{ unit:'reps', rate:0.45 }, burpees:{ unit:'reps', rate:1.20 }, pullups:{ unit:'reps', rate:2.00 }, dips:{ unit:'reps', rate:1.60 },
+  // time
+  plank:{ unit:'seconds', rate:0.20 },
+  // cardio
+  run_miles:{ unit:'miles', rate:40 }, run:{ unit:'minutes', rate:0.35 }, cycle_miles:{ unit:'miles', rate:14 },
+  row_minutes:{ unit:'minutes', rate:0.45 }, swim_laps:{ unit:'laps', rate:20 },
+  // session (generic)
   strengthsession:{ unit:'sessions', rate:40 }
 };
 
-/* ---------------- Gear Tier Gates (T1–T10, gated by level) ---------------- */
+/* ---------------- Tier gating (T1–T10) ---------------- */
 function maxTierForLevel(lvl){
   if (lvl >= 900) return 10;
   if (lvl >= 750) return 9;
@@ -172,7 +178,7 @@ function filterGearByTier(items, lvl){
   return items.filter(i => (i.type==='weapon'||i.type==='armor') && (i.tier||1) <= cap);
 }
 
-/* ---------------- Shop Items (T1—T10) ---------------- */
+/* ---------------- Shop Items (Weapons/Armor/Trinkets/Pets/Mounts up to T10) ---------------- */
 function buildShopItems(){
   const weapons = [
     { name:'Wooden Club',       type:'weapon', tier:1,  atk:2,  price:120 },
@@ -213,152 +219,65 @@ function buildShopItems(){
     { name:'Celestial Relic',     type:'trinket', tier:9,  bonus:'+12% all XP',         price:9200 },
     { name:'Omniscient Eye',      type:'trinket', tier:10, bonus:'+14% all XP',         price:12000 }
   ];
-  const consumables = [
-    { name:'Health Potion', type:'consumable', effect:'Restore stamina (flavor)', price:100 },
-    { name:'Energy Drink',  type:'consumable', effect:'+10% XP for next log',     price:160 },
-    { name:'Treasure Map',  type:'consumable', effect:'Guarantee loot on /adventure', price:500 }
-  ];
   const pets = [
-    { name:'Pocket Slime', type:'pet',   bonus:'+2% XP from logs', price:900,  tier:2 },
-    { name:'Trail Hawk',   type:'pet',   bonus:'+3% run XP',       price:1200, tier:3 }
+    { name:'Pocket Slime',   type:'pet',   tier:2,  bonus:'+2% XP from logs',          price:900  },
+    { name:'Trail Hawk',     type:'pet',   tier:3,  bonus:'+3% run XP',                price:1200 },
+    { name:'Cinder Pup',     type:'pet',   tier:4,  bonus:'+3 Power in hunts',         price:1800 },
+    { name:'Glacier Cub',    type:'pet',   tier:5,  bonus:'+4% plank XP',              price:2400 },
+    { name:'Storm Lynx',     type:'pet',   tier:6,  bonus:'+5% coins',                 price:3200 },
+    { name:'Dune Raptor',    type:'pet',   tier:7,  bonus:'+6% hunt loot',             price:4200 },
+    { name:'Aether Wisp',    type:'pet',   tier:8,  bonus:'+8% all XP',                price:5600 },
+    { name:'Sun Phoenix',    type:'pet',   tier:9,  bonus:'+10% adventure loot',       price:7400 },
+    { name:'Time Dragonling',type:'pet',   tier:10, bonus:'+12% all XP, +2 raid Power',price:9800 }
   ];
   const mounts = [
-    { name:'Sprint Goat',  type:'mount', bonus:'+5% hunt token chance', price:1500, tier:3 },
-    { name:'Shadow Steed', type:'mount', bonus:'+5 Power in hunts',     price:2200, tier:4 }
+    { name:'Sprint Goat',   type:'mount', tier:3,  bonus:'+5% hunt token chance',   price:1500 },
+    { name:'Shadow Steed',  type:'mount', tier:4,  bonus:'+5 Power in hunts',       price:2200 },
+    { name:'Crystal Stag',  type:'mount', tier:5,  bonus:'+6% run XP',              price:3000 },
+    { name:'Thunder Elk',   type:'mount', tier:6,  bonus:'+6 raid Power',           price:3800 },
+    { name:'Sand Strider',  type:'mount', tier:7,  bonus:'+8% coins',               price:4800 },
+    { name:'Cloud Roc',     type:'mount', tier:8,  bonus:'+8% daily rewards',       price:6200 },
+    { name:'Star Gryphon',  type:'mount', tier:9,  bonus:'+10% hunt loot',          price:8200 },
+    { name:'Void Drake',    type:'mount', tier:10, bonus:'+12% everything (flavor)',price:11000 }
   ];
-  return [...weapons, ...armors, ...trinkets, ...consumables, ...pets, ...mounts];
+  const consumables = [
+    { name:'Health Potion', type:'consumable', effect:'Flavor heal', price:100 },
+    { name:'Energy Drink',  type:'consumable', effect:'+10% XP next log', price:160 },
+    { name:'Treasure Map',  type:'consumable', effect:'Guarantee loot on /adventure', price:500 }
+  ];
+  return [...weapons, ...armors, ...trinkets, ...pets, ...mounts, ...consumables];
 }
 store.shop.items = store.shop.items?.length ? store.shop.items : buildShopItems();
 
-/* ---------------- ASCII Sprite library + art helper ---------------- */
-const SPRITES = {
-  goblin:
-`  ,      ,
- /(.-""-.)\\
- |\\  \\/  /|
- | \\_/\\_/ |
- \\  /  \\  /
-  \\/    \\/`,
-  wolf:
-`  /\\   /\\
- //\\\\_//\\\\
- \\_     _/
-  / * * \\
-  \\_^_^_/`,
-  ogre:
-`   _____
-  /     \\
- |  0 0  |
- |   ^   |
- |  '-'  |
-  \\_____/
-  _|_|_|_`,
-  pocket_slime:
-`   __
- _(  )_
-(  oo  )
- \\_.._/`,
-  trail_hawk:
-`  __
-{_  \\_
-  \\  __)
-  / /`,
-  sprint_goat:
-`  __  _
- (  \\/ )
-  \\__/\\
-  /\\  \\
- (_/  /_)`,
-  shadow_steed:
-`   /\\
-  //\\\\
- /_  _\\
-  /\\/\\
-  \\__/`,
-  starpiercer_lance:
-`   /\\
-  /  \\
-  |  |
-  |  |
-  |  |
-  \\__/`,
-  voidreaver_scythe:
-`   __
-  /  \\
- | () |
-  \\__/
-   ||
-  /__\\`,
-  aurora_greatsword:
-`   /\\
-  /  \\
- | || |
- | || |
-  \\__/`,
-  transcendent_blade:
-`   /\\
-  /++\\
- |++++|
- |++++|
-  \\__/`,
-  aegis_of_dawn:
-`  .----.
- /      \\
-|  ()    |
- \\      /
-  '----'`,
-  eclipse_barrier:
-`  .----.
- / **** \\
-| *    * |
- \\ **** /
-  '----'`,
-  mythril_bastion:
-`  .----.
- / ==== \\
-| |====| |
- \\ ==== /
-  '----'`,
-  omega_bulwark:
-`  .----.
- / OOOO \\
-| O    O |
- \\ OOOO /
-  '----'`
-};
-function spriteBlockOrImage(key) {
-  const artUrl = store.artMap?.[key.toLowerCase()] || store.artMap?.[key] || null;
-  if (artUrl) return { image: artUrl, text: null };
-  const k = key.replace(/\s+/g,'_').toLowerCase();
-  const ascii = SPRITES[key] || SPRITES[k] || null;
-  return ascii ? { image: null, text: '```\n' + ascii + '\n```' } : { image: null, text: null };
+/* ---------------- Art helper (images only) ---------------- */
+function artURL(key){
+  if (!key) return null;
+  return store.artMap[key] || store.artMap[key.toLowerCase()] || store.artMap[key.replace(/\s+/g,'_').toLowerCase()] || null;
 }
 
-/* ---------------- Exercise Themes + targets (for hunts/raids) ---------------- */
+/* ---------------- Exercise themes (for hunts/raids) ---------------- */
 const EXERCISE_THEMES = {
   pushups:      { label:'Pushups',      unit:'reps',   key:'pushups' },
   squats:       { label:'Bodyweight Squats', unit:'reps', key:'squats' },
   situps:       { label:'Sit-ups',      unit:'reps',   key:'situps' },
-  pullups:       { label:'Pull-ups',    unit:'reps',   key:'pullups' },
+  pullups:      { label:'Pull-ups',     unit:'reps',   key:'pullups' },
   burpees:      { label:'Burpees',      unit:'reps',   key:'burpees' },
   plank_seconds:{ label:'Plank (seconds)', unit:'seconds', key:'plank' },
   run_miles:    { label:'Run Distance', unit:'miles',  key:'run_miles' }
 };
-function targetFor(mode, exercise){
-  const m = (mode==='solo')? 'solo' : (mode==='party' ? 'party' : 'trio');
-  switch(exercise){
-    case 'pushups':       return { solo:100, trio:500, party:800 }[m];
-    case 'squats':        return { solo:150, trio:700, party:1100 }[m];
-    case 'situps':        return { solo:120, trio:600, party:900 }[m];
-    case 'pullups':       return { solo:25,  trio:80,  party:130 }[m];
-    case 'burpees':       return { solo:50,  trio:220, party:360 }[m];
-    case 'plank_seconds': return { solo:180, trio:600, party:900 }[m];
-    case 'run_miles':     return { solo:2,   trio:5,   party:8 }[m];
-    default:              return { solo:100, trio:500, party:800 }[m];
-  }
+function targetFor(exercise, partySize){
+  // Your examples: 1:100 pushups / 3:500 / 5:800, roughly scale
+  const base = {
+    pushups:100, squats:150, situps:120, pullups:25, burpees:50, plank_seconds:180, run_miles:2
+  };
+  const add = { 1:0, 2:60, 3:400, 4:600, 5:800 };
+  const b = base[exercise] ?? 100;
+  return (exercise==='run_miles')
+    ? ( {1:2,2:3,3:5,4:7,5:8}[partySize] ?? 2 )
+    : b + (add[partySize] ?? 0);
 }
 
-/* ---------------- Daily Challenges + Bounties ---------------- */
+/* ---------------- Daily Challenges + Bounties (unchanged from last build) ---------------- */
 function Rrange(a,b){ return R(a,b); }
 function generateDaily(){
   const packs = [
@@ -396,7 +315,6 @@ function dailyEmbed(){
   const lines = d.tasks.map(t=>`• **${t.desc}** — ${t.target} ${t.unit} 〔+${t.xp} XP, +${t.coins} coins〕`);
   return new EmbedBuilder().setTitle(`📆 Daily Challenge — ${d.theme}`).setColor(0x3498db).setDescription(lines.join('\n'));
 }
-
 function bountyKey(){ return todayISO(); }
 function generateDailyBounty(){
   return {
@@ -449,25 +367,22 @@ function shopEmbed(page=1){
   return { emb, page:p, totalPages };
 }
 
-/* ---------------- Hunts (themeable, workout-gated) ---------------- */
-const HUNT_MODES = {
-  solo:  { label:'Solo',  maxParty:1,  reward:'decent' },
-  trio:  { label:'Trio',  maxParty:3,  reward:'good'   },
-  party: { label:'Party', maxParty:5,  reward:'great'  }
-};
+/* ---------------- Hunts (workout-gated, party size 1–5) ---------------- */
 const HUNT_REWARDS = {
-  decent: { coins:[120,220], xp:[150,240], gearOdds: 0.18 },
-  good:   { coins:[220,380], xp:[260,420], gearOdds: 0.28 },
-  great:  { coins:[360,600], xp:[380,640], gearOdds: 0.38 },
+  1: { coins:[120,220], xp:[150,240], gearOdds: 0.18 },
+  2: { coins:[180,300], xp:[200,320], gearOdds: 0.22 },
+  3: { coins:[220,380], xp:[260,420], gearOdds: 0.28 },
+  4: { coins:[300,520], xp:[320,540], gearOdds: 0.34 },
+  5: { coins:[360,600], xp:[380,640], gearOdds: 0.38 }
 };
 function getActiveHunt(channelId){ return store.hunts[channelId] || null; }
-function openHunt(channelId, mode, exercise, starterId){
-  const m = HUNT_MODES[mode] || HUNT_MODES.trio;
+function openHunt(channelId, partySize, exercise, starterId){
   const theme = EXERCISE_THEMES[exercise] || EXERCISE_THEMES.pushups;
-  const target = targetFor(mode, exercise);
+  const target = targetFor(exercise, partySize);
   const deadline = Date.now() + (store.config.huntDurationMin||60)*60*1000;
   store.hunts[channelId] = {
-    mode, exercise, unit: theme.unit, target, maxParty: m.maxParty, deadline,
+    partySize: clamp(partySize,1,5), exercise, unit: theme.unit, target,
+    maxParty: clamp(partySize,1,5), deadline,
     startedBy: starterId,
     participants:{}, total:0, completed:false
   };
@@ -497,26 +412,20 @@ function huntStatusEmbed(channel){
   const timeLeft = Math.max(0, h.deadline - Date.now());
   const mins = Math.floor(timeLeft/60000), secs = Math.floor((timeLeft%60000)/1000);
   const partLines = Object.entries(h.participants).map(([id,p])=>`• <@${id}> — ${p.contribution} ${h.unit}`);
-  const m = HUNT_MODES[h.mode];
   const theme = EXERCISE_THEMES[h.exercise];
-  const header = `${m.label} • ${theme.label}`;
+  const header = `Party ${Object.keys(h.participants).length}/${h.maxParty} • ${theme.label}`;
 
   const emb = new EmbedBuilder()
-    .setTitle(`🗡️ Hunt: ${header}`)
+    .setTitle(`🗡️ Hunt (${h.partySize})`)
     .setColor(0x00b894)
     .setDescription([
+      `**${header}**`,
       `Progress: **${h.total}/${h.target} ${h.unit}**`,
-      `Party: ${Object.keys(h.participants).length}/${h.maxParty} • Ends in **${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}**`,
+      `Ends in **${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}**`,
       partLines.length?partLines.join('\n'):'_No participants yet_',
       '',
       `Log **${theme.label}** in this channel while the hunt is active!`
-    ].join('\n'))
-    .setFooter({ text: 'Each member spends 1 token to join. Gear drops are tier-gated.' });
-
-  const modeKey = ({solo:'pocket_slime', trio:'wolf', party:'ogre'})[h.mode] || 'pocket_slime';
-  const { image: artUrl, text: artBlock } = spriteBlockOrImage(modeKey);
-  if (artBlock) emb.setDescription(`${artBlock}\n${emb.data.description || ''}`);
-  if (artUrl) emb.setImage(artUrl);
+    ].join('\n'));
   return emb;
 }
 async function resolveHunt(channel){
@@ -524,8 +433,7 @@ async function resolveHunt(channel){
   if (!h || h.completed) return;
   h.completed = true;
 
-  const rewardKey = HUNT_MODES[h.mode].reward;
-  const pay = HUNT_REWARDS[rewardKey];
+  const pay = HUNT_REWARDS[h.partySize] || HUNT_REWARDS[3];
   const winners = h.total >= h.target;
   const ids = Object.keys(h.participants);
   const lines = [];
@@ -548,9 +456,7 @@ async function resolveHunt(channel){
       if (pool.length && Math.random() < pay.gearOdds) {
         const item = pool[R(0, pool.length-1)];
         u.inventory.push(item.name);
-        lootText = `**${item.name}** (Tier ${item.tier})`;
-
-        // Item art showcase (per-drop mini embed)
+        lootText = `**${item.name}** (T${item.tier})`;
         showcaseItem(channel, uid, item.name, '🗡️ Hunt Loot');
       }
       lines.push(`• <@${uid}>: **+${xp} XP**, **+${coins} coins** — ${lootText}`);
@@ -562,13 +468,12 @@ async function resolveHunt(channel){
   }
   saveSoon();
 
-  const title = winners ? '🏆 Hunt Cleared!' : '⌛ Hunt Ended (Failed)';
   channel.send({
     embeds:[ new EmbedBuilder()
-      .setTitle(title)
+      .setTitle(winners ? '🏆 Hunt Cleared!' : '⌛ Hunt Ended (Failed)')
       .setColor(winners ? 0x2ecc71 : 0xe74c3c)
       .setDescription([
-        `Mode: **${HUNT_MODES[h.mode].label}** — Theme: **${EXERCISE_THEMES[h.exercise].label}**`,
+        `Party Size: **${h.partySize}** — Theme: **${EXERCISE_THEMES[h.exercise].label}**`,
         `Final: **${h.total}/${h.target} ${h.unit}**`,
         '',
         ...lines
@@ -579,7 +484,7 @@ async function resolveHunt(channel){
   delete store.hunts[channel.id]; saveSoon();
 }
 
-/* ---------------- Raids (themeable) ---------------- */
+/* ---------------- Raids (auto-updating status embed) ---------------- */
 function bossNameForExercise(ex){
   return ({
     pushups:'Titan of Iron',
@@ -609,14 +514,12 @@ function raidStatusEmbed(channel){
   const leftMs = Math.max(0, r.deadline - Date.now());
   const hrs = Math.floor(leftMs/3600000), mins = Math.floor((leftMs%3600000)/60000);
   const lines = Object.entries(r.participants).map(([id,v])=>`• <@${id}> — ${v} ${r.unit}`);
-  const barLen = 24;
+  const barLen = 28;
   const pct = Math.max(0, Math.min(1, 1 - (r.hp / r.hpMax)));
   const filled = Math.round(barLen * pct);
   const bar = '█'.repeat(filled) + '░'.repeat(barLen-filled);
 
-  const { image: artUrl, text: artBlock } = spriteBlockOrImage(r.bossName.toLowerCase().replace(/\s+/g,'_'));
   const desc = [
-    artBlock ? artBlock : '',
     `**${r.bossName}** — HP: ${r.hp}/${r.hpMax}`,
     `Progress: ${Math.round(pct*100)}%  ${bar}`,
     `Theme: **${EXERCISE_THEMES[r.exercise].label}** • Ends in **${hrs}h ${mins}m**`,
@@ -624,11 +527,25 @@ function raidStatusEmbed(channel){
     lines.length?lines.join('\n'):'_No participants yet_',
     '',
     `Log **${EXERCISE_THEMES[r.exercise].label}** in this channel to deal damage!`
-  ].filter(Boolean).join('\n');
+  ].join('\n');
 
   const emb = new EmbedBuilder().setTitle('🛡️ Raid').setColor(0x9b59b6).setDescription(desc);
-  if (artUrl) emb.setImage(artUrl);
+  const art = artURL(r.bossName) || artURL(r.bossName.toLowerCase().replace(/\s+/g,'_'));
+  if (art) emb.setImage(art);
   return emb;
+}
+async function postOrUpdateRaidMessage(channel){
+  const r = store.raids[channel.id];
+  if (!r) return;
+  const emb = raidStatusEmbed(channel);
+  try {
+    if (r.messageId) {
+      const msg = await channel.messages.fetch(r.messageId).catch(()=>null);
+      if (msg) { await msg.edit({ embeds:[emb] }); return; }
+    }
+    const sent = await channel.send({ embeds:[emb] });
+    r.messageId = sent.id; saveSoon();
+  } catch(e){ /* ignore */ }
 }
 function endRaid(channel, success){
   const r = store.raids[channel.id]; if (!r) return;
@@ -650,7 +567,7 @@ function endRaid(channel, success){
       if (pool.length && Math.random() < 0.25) {
         const item = pool[R(0,pool.length-1)];
         u.inventory.push(item.name);
-        lootText = `**${item.name}** (Tier ${item.tier})`;
+        lootText = `**${item.name}** (T${item.tier})`;
         showcaseItem(channel, uid, item.name, '🏰 Raid Loot');
       }
       lines.push(`• <@${uid}>: +${xp} XP, +${coins} coins — ${lootText}`);
@@ -687,14 +604,14 @@ function playerPower(user){
   return Math.max(10, Math.floor(pow));
 }
 
-/* ---------------- Item Showcase Helper (art on equip/loot) ---------------- */
+/* ---------------- Item Showcase (images only) ---------------- */
 async function showcaseItem(channel, userId, itemName, title='🎁 New Item'){
-  const { image: artUrl, text: artBlock } = spriteBlockOrImage(itemName);
+  const url = artURL(itemName);
   const emb = new EmbedBuilder()
     .setTitle(`${title}`)
     .setColor(0x00c2ff)
-    .setDescription(`${artBlock?artBlock+'\n':''}**<@${userId}>** obtained **${itemName}**`);
-  if (artUrl) emb.setImage(artUrl);
+    .setDescription(`**<@${userId}>** obtained **${itemName}**`);
+  if (url) emb.setImage(url);
   channel.send({ embeds:[emb] }).catch(()=>{});
 }
 
@@ -703,6 +620,7 @@ const commands = [
   new SlashCommandBuilder().setName('ping').setDescription('Latency check'),
   new SlashCommandBuilder().setName('help').setDescription('Show commands & tips'),
   new SlashCommandBuilder().setName('profile').setDescription('View your stats'),
+  new SlashCommandBuilder().setName('inventory').setDescription('See what you own'),
 
   new SlashCommandBuilder().setName('log').setDescription('Log a workout')
     .addStringOption(o=>o.setName('type').setDescription('Exercise type').setRequired(true)
@@ -726,14 +644,14 @@ const commands = [
     .addStringOption(o=>o.setName('item').setDescription('Exact item name').setRequired(true)),
   new SlashCommandBuilder().setName('equip').setDescription('Equip a weapon/armor/trinket')
     .addStringOption(o=>o.setName('item').setDescription('Exact item name').setRequired(true)),
-  new SlashCommandBuilder().setName('summonpet').setDescription('Summon a pet')
+  new SlashCommandBuilder().setName('summonpet').setDescription('Equip a pet')
     .addStringOption(o=>o.setName('item').setDescription('Exact pet name').setRequired(true)),
   new SlashCommandBuilder().setName('equipmount').setDescription('Equip a mount')
     .addStringOption(o=>o.setName('item').setDescription('Exact mount name').setRequired(true)),
 
   new SlashCommandBuilder().setName('setart').setDescription('Admin: set art image for key or name')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .addStringOption(o=>o.setName('key').setDescription('monster key or item name').setRequired(true))
+    .addStringOption(o=>o.setName('key').setDescription('monster or item name').setRequired(true))
     .addAttachmentOption(o=>o.setName('image').setDescription('Upload an image').setRequired(true)),
 
   new SlashCommandBuilder().setName('daily').setDescription('Daily challenge')
@@ -744,11 +662,10 @@ const commands = [
     .addSubcommand(s=>s.setName('show').setDescription('Show today’s bounties'))
     .addSubcommand(s=>s.setName('claim').setDescription('Claim bounty rewards')),
 
-  // Hunts (themeable)
+  // Hunts: choose party size (1–5) + exercise
   new SlashCommandBuilder().setName('hunt').setDescription('Workout hunt (themed)')
     .addSubcommand(s=>s.setName('create').setDescription('Start a hunt here')
-      .addStringOption(o=>o.setName('mode').setDescription('solo|trio|party').setRequired(true)
-        .addChoices({name:'solo',value:'solo'},{name:'trio',value:'trio'},{name:'party',value:'party'}))
+      .addIntegerOption(o=>o.setName('size').setDescription('Party size 1–5').setRequired(true).setMinValue(1).setMaxValue(5))
       .addStringOption(o=>o.setName('exercise').setDescription('Exercise theme').setRequired(true)
         .addChoices(
           {name:'Pushups',value:'pushups'},{name:'Squats',value:'squats'},{name:'Sit-ups',value:'situps'},
@@ -760,7 +677,7 @@ const commands = [
     .addSubcommand(s=>s.setName('leave').setDescription('Leave the hunt'))
     .addSubcommand(s=>s.setName('cancel').setDescription('Admin: cancel hunt')),
 
-  // Raids (themeable)
+  // Raids (themeable + auto-updating message)
   new SlashCommandBuilder().setName('raid').setDescription('Themeable raid')
     .addSubcommand(s=>s.setName('create').setDescription('Start a raid (admin)')
       .addStringOption(o=>o.setName('exercise').setDescription('Damage exercise').setRequired(true)
@@ -773,7 +690,10 @@ const commands = [
       .addIntegerOption(o=>o.setName('hours').setDescription('Duration in hours (default 24)').setRequired(false))
       .addStringOption(o=>o.setName('name').setDescription('Boss name').setRequired(false)))
     .addSubcommand(s=>s.setName('status').setDescription('Raid status'))
-    .addSubcommand(s=>s.setName('cancel').setDescription('Admin: cancel raid'))
+    .addSubcommand(s=>s.setName('cancel').setDescription('Admin: cancel raid')),
+
+  // Adventure (token-gated loot-first)
+  new SlashCommandBuilder().setName('adventure').setDescription('Spend 1 token for a quick adventure'),
 ];
 
 /* ---------------- Command registration ---------------- */
@@ -811,17 +731,25 @@ async function applyLevelRole(member, lvl){
 async function sendLevelUp(member, newLevel){
   const channelId = store.config.levelUpChannelId || LEVELUP_CHANNEL_ID;
   const ch = channelId ? await member.client.channels.fetch(channelId).catch(()=>null) : member.guild.systemChannel;
-  const titles = ['LEVEL UP!', 'POWER SURGE!', 'NEW RANK!'];
-  const title = titles[R(0,titles.length-1)];
   const emb = new EmbedBuilder()
-    .setTitle(`🎉✨ ${title} ✨🎉`)
+    .setTitle(`🎉✨ LEVEL UP! ✨🎉`)
     .setColor(0xf1c40f)
     .setDescription(`**${member.user.username}** reached **Level ${newLevel}**!`)
     .setThumbnail(member.user.displayAvatarURL());
   if (ch) ch.send({ embeds:[emb] }).catch(()=>{});
 }
 
-/* ---------------- Workout log & XP ---------------- */
+/* ---------------- XP bar builder ---------------- */
+function xpBar(user){
+  const lvl = levelFromXp(user.xp);
+  const need = xpForLevel(lvl+1);
+  const prog = user.xp - totalXpForLevel(lvl);
+  const barLen=20, pct = Math.max(0, Math.min(1, prog/Math.max(1,need)));
+  const filled = Math.round(barLen*pct);
+  return { lvl, need, prog, bar: '█'.repeat(filled) + '░'.repeat(barLen-filled), pct: Math.round(pct*100) };
+}
+
+/* ---------------- Workout log & XP (with bar + raid auto-update) ---------------- */
 function computeXp(type, amount, user){
   const cfg = BUILT_INS[type];
   if (!cfg) return 0;
@@ -829,6 +757,7 @@ function computeXp(type, amount, user){
   const lvl = levelFromXp(user.xp);
   if (lvl < 5) xp *= 1.2;
   else if (lvl < 20) xp *= 1.1;
+  // simple pet perks
   if (user.equipped?.pet === 'Pocket Slime') xp *= 1.02;
   if (user.equipped?.pet === 'Trail Hawk' && type==='run_miles') xp *= 1.03;
   return Math.round(xp);
@@ -847,7 +776,8 @@ async function doWorkoutLog(interaction, type, amount){
   const xpGain = computeXp(type, amount, user);
   const preLevel = levelFromXp(user.xp);
   user.xp += xpGain;
-  user.coins += Math.max(1, Math.floor(xpGain/3));
+  const coinGain = Math.max(1, Math.floor(xpGain/3));
+  user.coins += coinGain;
   user.tokens += 1; // 1 token per log
   user.lastLog = now;
   user.lastActiveISO = todayISO();
@@ -870,12 +800,12 @@ async function doWorkoutLog(interaction, type, amount){
         h.total += add;
         h.participants[interaction.user.id].contribution += add;
         if (h.total >= h.target) await resolveHunt(interaction.channel);
-        else saveSoon();
+        else { saveSoon(); interaction.channel.send({ embeds:[huntStatusEmbed(interaction.channel)] }).catch(()=>{}); }
       }
     }
   } catch(e){ console.error('HUNT_PROGRESS_ERROR', e); }
 
-  // Raid contribution
+  // Raid contribution (auto-update embed)
   try {
     const r = interaction.channel && store.raids[interaction.channel.id];
     if (r && !r.done && Date.now() < r.deadline && r.hp > 0) {
@@ -893,15 +823,29 @@ async function doWorkoutLog(interaction, type, amount){
         r.hp = Math.max(0, r.hp - dmg);
         r.participants[interaction.user.id] = (r.participants[interaction.user.id]||0) + dmg;
         if (r.hp === 0){ r.done = true; saveSoon(); endRaid(interaction.channel, true); }
-        else saveSoon();
+        else { saveSoon(); await postOrUpdateRaidMessage(interaction.channel); }
       }
     }
   } catch(e){ console.error('RAID_PROGRESS_ERROR', e); }
 
   saveSoon();
 
-  await interaction.reply({ content: `✅ Logged **${amount} ${cfg.unit}** ${EXERCISE_THEMES[type]?.label||type}\n+${xpGain} XP • +${Math.max(1,Math.floor(xpGain/3))} coins • +1 token` });
+  // XP bar reply (always visible)
+  const bar = xpBar(user);
+  const emb = new EmbedBuilder()
+    .setTitle('✅ Workout logged!')
+    .setColor(0x1abc9c)
+    .setDescription([
+      `**${amount} ${cfg.unit}** ${EXERCISE_THEMES[type]?.label || type}`,
+      `+${xpGain} XP • +${coinGain} coins • +1 token`,
+      '',
+      `Level **${bar.lvl}**  —  ${bar.prog}/${bar.need} XP  (${bar.pct}%)`,
+      `${bar.bar}`
+    ].join('\n'))
+    .setThumbnail(interaction.user.displayAvatarURL());
+  await interaction.reply({ embeds:[emb] });
 
+  // Flashy level-up (separate message in level-up channel)
   const newLevel = levelFromXp(user.xp);
   if (newLevel > preLevel){
     const member = await interaction.guild.members.fetch(interaction.user.id).catch(()=>null);
@@ -919,283 +863,333 @@ client.on('guildMemberAdd', async (member) => {
   const emb = new EmbedBuilder()
     .setTitle('🎉 A new challenger approaches!')
     .setColor(0x00d084)
-    .setDescription(`Welcome **${member.user.username}**!\nUse **/help** to see commands.\nLog workouts with **/p**, **/plank**, **/run** or **/log**.\nJoin hunts with **/hunt create** → **/hunt join**.`)
+    .setDescription(`Welcome **${member.user.username}**!\nUse **/help** to see commands.\nLog workouts with **/p**, **/plank**, **/run** or **/log**.\nStart a hunt with **/hunt create**.`)
     .setThumbnail(member.user.displayAvatarURL());
   ch.send({ content:`<@${member.id}>`, embeds:[emb] }).catch(()=>{});
 });
 
-/* ---------------- Interactions ---------------- */
-client.on('interactionCreate', async (interaction) => {
-  if (interaction.isChatInputCommand()){
-    const user = ensureUser(interaction.user.id);
-    switch (interaction.commandName){
+/* ---------------- Adventure (token-gated, loot-first) ---------------- */
+async function doAdventure(interaction){
+  const u = ensureUser(interaction.user.id);
+  const now = Date.now();
+  if (now - u.lastAdventure < (store.config.huntCooldownSec||20)*1000){
+    const wait = Math.ceil((((store.config.huntCooldownSec||20)*1000)-(now-u.lastAdventure))/1000);
+    return interaction.reply({ content:`⏳ Adventure cooldown. Try again in ${wait}s.`, ephemeral:true });
+  }
+  if ((u.tokens||0) <= 0) return interaction.reply({ content:'⚠️ You need 1 token. Log a workout to earn tokens.', ephemeral:true });
 
-      case 'ping': {
-        const sent = Date.now();
-        await interaction.reply({ content:'Pinging...' });
-        const diff = Date.now() - sent;
-        return interaction.editReply(`🏓 Pong! ${diff}ms`);
-      }
+  u.tokens -= 1;
+  u.lastAdventure = now;
 
-      case 'help': {
-        const emb = new EmbedBuilder()
-          .setTitle('📖 FitRPG Help')
-          .setColor(0x95a5a6)
-          .setDescription([
-            '**Quick Log:** `/p <reps>`, `/plank <seconds>`, `/run miles:<miles>`',
-            '**General Log:** `/log type:<exercise> amount:<n>`',
-            '**Profile:** `/profile`',
-            '**Shop:** `/shop`, `/buy item:<name>`, `/equip item:<name>`',
-            '**Pets/Mounts:** `/summonpet`, `/equipmount`',
-            '**Hunts (themed):** `/hunt create mode:<solo|trio|party> exercise:<type>` → `/hunt join` → log matching exercise *in this channel*',
-            '**Raids (themed):** `/raid create exercise:<type> [hours] [hp] [name]` → log matching exercise *in this channel*',
-            '**Daily:** `/daily show` → `/daily claim`',
-            '**Bounty:** `/bounty show` → `/bounty claim`',
-            '**Art:** `/setart key:"Item Or Monster Name" image:<upload>`',
-            '',
-            '_Tip: the shop uses buttons; perfect on mobile._'
-          ].join('\n'));
-        return interaction.reply({ embeds:[emb], ephemeral:true });
-      }
+  // modest xp/coin, chance at tier-gated gear
+  const xp = R(80,140);
+  const coins = R(90,160);
+  u.xp += xp; u.coins += coins;
+  const lvl = levelFromXp(u.xp);
+  const pool = filterGearByTier(store.shop.items, lvl);
+  let loot = null;
+  if (pool.length && Math.random() < 0.25) {
+    loot = pool[R(0,pool.length-1)];
+    u.inventory.push(loot.name);
+  }
+  saveSoon();
 
-      case 'profile': {
-        const lvl = levelFromXp(user.xp);
-        const nxt = xpForLevel(lvl+1);
-        const prog = user.xp - totalXpForLevel(lvl);
-        const barLen=20, pct = Math.max(0, Math.min(1, prog/Math.max(1,nxt)));
-        const bar = '█'.repeat(Math.round(barLen*pct)) + '░'.repeat(barLen-Math.round(barLen*pct));
-        const emb = new EmbedBuilder()
-          .setTitle(`🧑‍🚀 ${interaction.user.username}`)
-          .setColor(0x1abc9c)
-          .setDescription([
-            `Level **${lvl}**`,
-            `XP ${prog}/${nxt}  ${Math.round(pct*100)}%  ${bar}`,
-            `Coins **${user.coins}**  • Tokens **${user.tokens}**`,
-            `Weapon: ${user.equipped.weapon||'—'} • Armor: ${user.equipped.armor||'—'} • Trinket: ${user.equipped.trinket||'—'}`,
-            `Pet: ${user.equipped.pet||'—'} • Mount: ${user.equipped.mount||'—'}`,
-            `Inventory: ${user.inventory.length ? user.inventory.slice(0,10).join(', ') + (user.inventory.length>10?'…':'') : '—'}`
-          ].join('\n'));
-        return interaction.reply({ embeds:[emb] });
-      }
-
-      case 'log': {
-        const type = interaction.options.getString('type');
-        const amount = interaction.options.getInteger('amount');
-        return doWorkoutLog(interaction, type, amount);
-      }
-
-      case 'p': {
-        const amount = interaction.options.getInteger('amount');
-        return doWorkoutLog(interaction, 'pushups', amount);
-      }
-
-      case 'plank': {
-        const amount = interaction.options.getInteger('amount');
-        return doWorkoutLog(interaction, 'plank', amount);
-      }
-
-      case 'run': {
-        const miles = interaction.options.getNumber('miles');
-        return doWorkoutLog(interaction, 'run_miles', Math.round(miles));
-      }
-
-      case 'shop': {
-        const reqPage = interaction.options.getInteger('page') || 1;
-        const { emb, page, totalPages } = shopEmbed(reqPage);
-        const prev = new ButtonBuilder().setCustomId(`shop:prev:${page}`).setLabel('Prev').setStyle(ButtonStyle.Secondary).setDisabled(page<=1);
-        const next = new ButtonBuilder().setCustomId(`shop:next:${page}`).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(page>=totalPages);
-        const row = new ActionRowBuilder().addComponents(prev, next);
-        return interaction.reply({ embeds:[emb], components:[row] });
-      }
-
-      case 'buy': {
-        const name = interaction.options.getString('item');
-        const item = store.shop.items.find(i=>i.name.toLowerCase()===name.toLowerCase());
-        if (!item) return interaction.reply({ content:'❌ Item not found.', ephemeral:true });
-        const u = ensureUser(interaction.user.id);
-        if (u.coins < item.price) return interaction.reply({ content:`❌ Need ${item.price} coins.`, ephemeral:true });
-        if ((item.type==='weapon'||item.type==='armor')){
-          const lvl = levelFromXp(u.xp);
-          if ((item.tier||1) > maxTierForLevel(lvl)){
-            return interaction.reply({ content:`❌ Tier too high. Need higher level for **T${item.tier}**.`, ephemeral:true });
-          }
-        }
-        u.coins -= item.price; u.inventory.push(item.name); saveSoon();
-        showcaseItem(interaction.channel, interaction.user.id, item.name, '🛍️ Purchase');
-        return;
-      }
-
-      case 'equip': {
-        const name = interaction.options.getString('item');
-        const u = ensureUser(interaction.user.id);
-        if (!u.inventory.includes(name)) return interaction.reply({ content:'❌ You do not own that item.', ephemeral:true });
-        const item = store.shop.items.find(i=>i.name===name);
-        if (!item || !['weapon','armor','trinket'].includes(item.type)) return interaction.reply({ content:'❌ Not equippable.', ephemeral:true });
-        u.equipped[item.type] = name; saveSoon();
-
-        const { image: artUrl, text: artBlock } = spriteBlockOrImage(item.name);
-        const emb = new EmbedBuilder().setTitle('🛡️ Equipped').setColor(0x00c2ff)
-          .setDescription(`${artBlock?artBlock+'\n':''}You equipped **${item.name}**${item.tier?` (T${item.tier})`:''}.`);
-        if (artUrl) emb.setImage(artUrl);
-        return interaction.reply({ embeds:[emb] });
-      }
-
-      case 'summonpet': {
-        const name = interaction.options.getString('item');
-        const u = ensureUser(interaction.user.id);
-        if(!u.inventory.includes(name)) return interaction.reply({ content:'❌ You don’t own that pet.', ephemeral:true });
-        if (!/slime|hawk/i.test(name)) return interaction.reply({ content:'❌ That’s not a pet.', ephemeral:true });
-        u.equipped.pet = name; saveSoon();
-        const { image: artUrl, text: artBlock } = spriteBlockOrImage(name);
-        const emb = new EmbedBuilder().setTitle('🐾 Pet summoned!').setColor(0x00c2ff)
-          .setDescription(`${artBlock?artBlock+'\n':''}**${name}** is now active!`);
-        if (artUrl) emb.setImage(artUrl);
-        return interaction.reply({ embeds:[emb] });
-      }
-
-      case 'equipmount': {
-        const name = interaction.options.getString('item');
-        const u = ensureUser(interaction.user.id);
-        if(!u.inventory.includes(name)) return interaction.reply({ content:'❌ You don’t own that mount.', ephemeral:true });
-        if (!/goat|steed/i.test(name)) return interaction.reply({ content:'❌ That’s not a mount.', ephemeral:true });
-        u.equipped.mount = name; saveSoon();
-        const { image: artUrl, text: artBlock } = spriteBlockOrImage(name);
-        const emb = new EmbedBuilder().setTitle('🐎 Mount equipped!').setColor(0x00c2ff)
-          .setDescription(`${artBlock?artBlock+'\n':''}**${name}** saddled up!`);
-        if (artUrl) emb.setImage(artUrl);
-        return interaction.reply({ embeds:[emb] });
-      }
-
-      case 'setart': {
-        if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({ content:'Admin only.', ephemeral:true });
-        const key = interaction.options.getString('key');
-        const att = interaction.options.getAttachment('image');
-        if (!att?.url) return interaction.reply({ content:'No image URL.', ephemeral:true });
-        store.artMap[key] = att.url;
-        store.artMap[key.toLowerCase()] = att.url;
-        store.artMap[key.replace(/\s+/g,'_').toLowerCase()] = att.url;
-        saveSoon();
-        return interaction.reply(`✅ Art set for **${key}**`);
-      }
-
-      case 'daily': {
-        const sub = interaction.options.getSubcommand();
-        const d = ensureDaily();
-        if (sub==='show') return interaction.reply({ embeds:[dailyEmbed()] });
-        if (sub==='claim'){
-          const u = ensureUser(interaction.user.id);
-          if (u.dailyProgress[`daily_${d.date}`]) return interaction.reply({ content:'✅ Already claimed today.', ephemeral:true });
-          const totalXp = d.tasks.reduce((a,t)=>a+t.xp,0);
-          const totalCoins = d.tasks.reduce((a,t)=>a+t.coins,0);
-          u.xp += totalXp; u.coins += totalCoins;
-          u.dailyProgress[`daily_${d.date}`] = true; saveSoon();
-          return interaction.reply(`📆 Daily complete! +${totalXp} XP, +${totalCoins} coins`);
-        }
-        break;
-      }
-
-      case 'bounty': {
-        const sub = interaction.options.getSubcommand();
-        const b = ensureDailyBounty();
-        if (sub==='show') return interaction.reply({ embeds:[bountyEmbed()] });
-        if (sub==='claim'){
-          const u = ensureUser(interaction.user.id);
-          if (u.dailyProgress[`bounty_${b.date}`]) return interaction.reply({ content:'✅ Already claimed today.', ephemeral:true });
-          const xp = b.tasks.reduce((a,t)=>a+t.rewardXp,0);
-          const coins = b.tasks.reduce((a,t)=>a+t.rewardCoins,0);
-          u.xp += xp; u.coins += coins;
-          u.dailyProgress[`bounty_${b.date}`] = true; saveSoon();
-          return interaction.reply(`🎯 Bounty complete! +${xp} XP, +${coins} coins`);
-        }
-        break;
-      }
-
-      case 'hunt': {
-        const sub = interaction.options.getSubcommand();
-        const ch = interaction.channel;
-        if (sub==='create'){
-          const mode = interaction.options.getString('mode');
-          const exercise = interaction.options.getString('exercise');
-          if (getActiveHunt(ch.id)) return interaction.reply({ content:'⚠️ A hunt is already active here.', ephemeral:true });
-          openHunt(ch.id, mode, exercise, interaction.user.id);
-          saveSoon();
-          return interaction.reply({ embeds:[huntStatusEmbed(ch)] });
-        }
-        if (sub==='join'){
-          const h = getActiveHunt(ch.id);
-          if (!h) return interaction.reply({ content:'❌ No active hunt in this channel. Use `/hunt create`.', ephemeral:true });
-          const u = ensureUser(interaction.user.id);
-          if ((u.tokens||0) <= 0) return interaction.reply({ content:'⚠️ You need 1 token to join. Log a workout to earn tokens.', ephemeral:true });
-          const { error, joined } = joinHunt(ch.id, interaction.user.id);
-          if (error) return interaction.reply({ content:`❌ ${error}`, ephemeral:true });
-          if (joined) { u.tokens -= 1; saveSoon(); }
-          return interaction.reply({ embeds:[huntStatusEmbed(ch)] });
-        }
-        if (sub==='status') return interaction.reply({ embeds:[huntStatusEmbed(interaction.channel)] });
-        if (sub==='leave'){
-          const { error } = leaveHunt(ch.id, interaction.user.id);
-          if (error) return interaction.reply({ content:`❌ ${error}`, ephemeral:true });
-          return interaction.reply({ content:'✅ You left the hunt.' });
-        }
-        if (sub==='cancel'){
-          if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({ content:'Admin only.', ephemeral:true });
-          if (!getActiveHunt(ch.id)) return interaction.reply({ content:'No active hunt.', ephemeral:true });
-          delete store.hunts[ch.id]; saveSoon();
-          return interaction.reply('🛑 Hunt cancelled.');
-        }
-        break;
-      }
-
-      case 'raid': {
-        const sub = interaction.options.getSubcommand();
-        const ch = interaction.channel;
-        if (sub==='create'){
-          if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({ content:'Admin only.', ephemeral:true });
-          if (store.raids[ch.id]) return interaction.reply({ content:'⚠️ A raid is already active here.', ephemeral:true });
-          const exercise = interaction.options.getString('exercise');
-          const hp = interaction.options.getInteger('hp') || bossHpDefault(exercise);
-          const hours = interaction.options.getInteger('hours') || 24;
-          const name = interaction.options.getString('name') || bossNameForExercise(exercise);
-          store.raids[ch.id] = {
-            theme: EXERCISE_THEMES[exercise].label,
-            exercise,
-            unit: EXERCISE_THEMES[exercise].unit,
-            bossName: name,
-            hp: hp, hpMax: hp,
-            deadline: Date.now() + hours*3600*1000,
-            startedBy: interaction.user.id,
-            participants: {},
-            done:false
-          };
-          saveSoon();
-          return interaction.reply({ embeds:[raidStatusEmbed(ch)] });
-        }
-        if (sub==='status') return interaction.reply({ embeds:[raidStatusEmbed(ch)] });
-        if (sub==='cancel'){
-          if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({ content:'Admin only.', ephemeral:true });
-          if (!store.raids[ch.id]) return interaction.reply({ content:'No active raid.', ephemeral:true });
-          delete store.raids[ch.id]; saveSoon();
-          return interaction.reply('🛑 Raid cancelled.');
-        }
-        break;
-      }
-
-      default: return;
-    }
+  const lines = [`**Adventure complete!** +${xp} XP, +${coins} coins`];
+  if (loot){
+    lines.push(`Loot: **${loot.name}** (T${loot.tier})`);
+  } else {
+    lines.push(`No gear this time. Use a **Treasure Map** to guarantee loot.`);
   }
 
-  // Shop pagination buttons
-  if (interaction.isButton() && interaction.customId.startsWith('shop:')) {
-    const parts = interaction.customId.split(':'); // ['shop','prev|next', currentPage]
-    const dir = parts[1];
-    const cur = parseInt(parts[2]||'1',10);
-    const newPage = dir==='prev' ? Math.max(1, cur-1) : cur+1;
+  const url = loot ? artURL(loot.name) : null;
+  const emb = new EmbedBuilder().setTitle('🧭 Adventure').setColor(0x2ecc71).setDescription(lines.join('\n'));
+  if (url) emb.setImage(url);
 
-    const { emb, page, totalPages } = shopEmbed(newPage);
-    const prev = new ButtonBuilder().setCustomId(`shop:prev:${page}`).setLabel('Prev').setStyle(ButtonStyle.Secondary).setDisabled(page<=1);
-    const next = new ButtonBuilder().setCustomId(`shop:next:${page}`).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(page>=totalPages);
-    const row = new ActionRowBuilder().addComponents(prev, next);
-    return interaction.update({ embeds:[emb], components:[row] });
+  return interaction.reply({ embeds:[emb] });
+}
+
+/* ---------------- Interactions ---------------- */
+client.on('interactionCreate', async (interaction) => {
+  try {
+    if (interaction.isChatInputCommand()){
+      const user = ensureUser(interaction.user.id);
+      switch (interaction.commandName){
+
+        case 'ping': {
+          await interaction.reply({ content:'🏓 Pong!' });
+          return;
+        }
+
+        case 'help': {
+          const emb = new EmbedBuilder()
+            .setTitle('📖 FitRPG Help')
+            .setColor(0x95a5a6)
+            .setDescription([
+              '**Quick Log:** `/p <reps>`, `/plank <seconds>`, `/run miles:<miles>`',
+              '**General Log:** `/log type:<exercise> amount:<n>`',
+              '**Profile:** `/profile`  •  **Inventory:** `/inventory`',
+              '**Shop:** `/shop`, `/buy item:<name>`, `/equip item:<name>`',
+              '**Pets/Mounts:** `/summonpet`, `/equipmount`',
+              '**Hunts:** `/hunt create size:<1–5> exercise:<type>` → `/hunt join` → log matching exercise *in this channel*',
+              '**Raids:** `/raid create exercise:<type> [hours] [hp] [name]` → logs auto-update the raid message',
+              '**Adventure:** `/adventure` (spend 1 token for loot & XP)',
+              '**Daily:** `/daily show` → `/daily claim`',
+              '**Bounty:** `/bounty show` → `/bounty claim`',
+              '**Art:** `/setart key:"Item or Boss Name" image:<upload>`'
+            ].join('\n'));
+          return interaction.reply({ embeds:[emb], ephemeral:true });
+        }
+
+        case 'profile': {
+          const bar = xpBar(user);
+          const emb = new EmbedBuilder()
+            .setTitle(`🧑‍🚀 ${interaction.user.username}`)
+            .setColor(0x1abc9c)
+            .setDescription([
+              `Level **${bar.lvl}**`,
+              `XP ${bar.prog}/${bar.need}  (${bar.pct}%)`,
+              `${bar.bar}`,
+              `Coins **${user.coins}**  • Tokens **${user.tokens}**`,
+              `Weapon: ${user.equipped.weapon||'—'} • Armor: ${user.equipped.armor||'—'} • Trinket: ${user.equipped.trinket||'—'}`,
+              `Pet: ${user.equipped.pet||'—'} • Mount: ${user.equipped.mount||'—'}`
+            ].join('\n'))
+            .setThumbnail(interaction.user.displayAvatarURL());
+          return interaction.reply({ embeds:[emb] });
+        }
+
+        case 'inventory': {
+          const inv = user.inventory.length ? user.inventory.join(', ') : '—';
+          const emb = new EmbedBuilder().setTitle('🎒 Inventory').setColor(0x7289da).setDescription(inv);
+          return interaction.reply({ embeds:[emb], ephemeral:true });
+        }
+
+        case 'log': {
+          const type = interaction.options.getString('type');
+          const amount = interaction.options.getInteger('amount');
+          return doWorkoutLog(interaction, type, amount);
+        }
+
+        case 'p': {
+          const amount = interaction.options.getInteger('amount');
+          return doWorkoutLog(interaction, 'pushups', amount);
+        }
+
+        case 'plank': {
+          const amount = interaction.options.getInteger('amount');
+          return doWorkoutLog(interaction, 'plank', amount);
+        }
+
+        case 'run': {
+          const miles = interaction.options.getNumber('miles');
+          return doWorkoutLog(interaction, 'run_miles', Math.round(miles));
+        }
+
+        case 'shop': {
+          const reqPage = interaction.options.getInteger('page') || 1;
+          const { emb, page, totalPages } = shopEmbed(reqPage);
+          const prev = new ButtonBuilder().setCustomId(`shop:prev:${page}`).setLabel('Prev').setStyle(ButtonStyle.Secondary).setDisabled(page<=1);
+          const next = new ButtonBuilder().setCustomId(`shop:next:${page}`).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(page>=totalPages);
+          const row = new ActionRowBuilder().addComponents(prev, next);
+          return interaction.reply({ embeds:[emb], components:[row] });
+        }
+
+        case 'buy': {
+          const name = interaction.options.getString('item');
+          const item = store.shop.items.find(i=>i.name.toLowerCase()===name.toLowerCase());
+          if (!item) return interaction.reply({ content:'❌ Item not found.', ephemeral:true });
+          if (user.coins < item.price) return interaction.reply({ content:`❌ Need ${item.price} coins.`, ephemeral:true });
+          if ((item.type==='weapon'||item.type==='armor')){
+            const lvl = levelFromXp(user.xp);
+            if ((item.tier||1) > maxTierForLevel(lvl)){
+              return interaction.reply({ content:`❌ Tier too high. Need higher level for **T${item.tier}**.`, ephemeral:true });
+            }
+          }
+          user.coins -= item.price; user.inventory.push(item.name); saveSoon();
+          showcaseItem(interaction.channel, interaction.user.id, item.name, '🛍️ Purchase');
+          return;
+        }
+
+        case 'equip': {
+          const name = interaction.options.getString('item');
+          if (!user.inventory.includes(name)) return interaction.reply({ content:'❌ You do not own that item.', ephemeral:true });
+          const item = store.shop.items.find(i=>i.name===name);
+          if (!item || !['weapon','armor','trinket'].includes(item.type)) return interaction.reply({ content:'❌ Not equippable as gear.', ephemeral:true });
+          user.equipped[item.type] = name; saveSoon();
+
+          const url = artURL(item.name);
+          const emb = new EmbedBuilder().setTitle('🛡️ Equipped').setColor(0x00c2ff)
+            .setDescription(`You equipped **${item.name}**${item.tier?` (T${item.tier})`:''}.`);
+          if (url) emb.setImage(url);
+          return interaction.reply({ embeds:[emb] });
+        }
+
+        case 'summonpet': {
+          const name = interaction.options.getString('item');
+          if(!user.inventory.includes(name)) return interaction.reply({ content:'❌ You don’t own that pet.', ephemeral:true });
+          const item = store.shop.items.find(i=>i.name===name);
+          if (!item || item.type!=='pet') return interaction.reply({ content:'❌ That’s not a pet.', ephemeral:true });
+          user.equipped.pet = name; saveSoon();
+          const url = artURL(name);
+          const emb = new EmbedBuilder().setTitle('🐾 Pet equipped!').setColor(0x00c2ff).setDescription(`**${name}** is now active!`);
+          if (url) emb.setImage(url);
+          return interaction.reply({ embeds:[emb] });
+        }
+
+        case 'equipmount': {
+          const name = interaction.options.getString('item');
+          if(!user.inventory.includes(name)) return interaction.reply({ content:'❌ You don’t own that mount.', ephemeral:true });
+          const item = store.shop.items.find(i=>i.name===name);
+          if (!item || item.type!=='mount') return interaction.reply({ content:'❌ That’s not a mount.', ephemeral:true });
+          user.equipped.mount = name; saveSoon();
+          const url = artURL(name);
+          const emb = new EmbedBuilder().setTitle('🐎 Mount equipped!').setColor(0x00c2ff).setDescription(`**${name}** saddled up!`);
+          if (url) emb.setImage(url);
+          return interaction.reply({ embeds:[emb] });
+        }
+
+        case 'setart': {
+          if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({ content:'Admin only.', ephemeral:true });
+          const key = interaction.options.getString('key');
+          const att = interaction.options.getAttachment('image');
+          if (!att?.url) return interaction.reply({ content:'No image URL.', ephemeral:true });
+          store.artMap[key] = att.url;
+          store.artMap[key.toLowerCase()] = att.url;
+          store.artMap[key.replace(/\s+/g,'_').toLowerCase()] = att.url;
+          saveSoon();
+          return interaction.reply(`✅ Art set for **${key}**`);
+        }
+
+        case 'daily': {
+          const sub = interaction.options.getSubcommand();
+          const d = ensureDaily();
+          if (sub==='show') return interaction.reply({ embeds:[dailyEmbed()] });
+          if (sub==='claim'){
+            if (user.dailyProgress[`daily_${d.date}`]) return interaction.reply({ content:'✅ Already claimed today.', ephemeral:true });
+            const totalXp = d.tasks.reduce((a,t)=>a+t.xp,0);
+            const totalCoins = d.tasks.reduce((a,t)=>a+t.coins,0);
+            user.xp += totalXp; user.coins += totalCoins;
+            user.dailyProgress[`daily_${d.date}`] = true; saveSoon();
+            return interaction.reply(`📆 Daily complete! +${totalXp} XP, +${totalCoins} coins`);
+          }
+          break;
+        }
+
+        case 'bounty': {
+          const sub = interaction.options.getSubcommand();
+          const b = ensureDailyBounty();
+          if (sub==='show') return interaction.reply({ embeds:[bountyEmbed()] });
+          if (sub==='claim'){
+            if (user.dailyProgress[`bounty_${b.date}`]) return interaction.reply({ content:'✅ Already claimed today.', ephemeral:true });
+            const xp = b.tasks.reduce((a,t)=>a+t.rewardXp,0);
+            const coins = b.tasks.reduce((a,t)=>a+t.rewardCoins,0);
+            user.xp += xp; user.coins += coins;
+            user.dailyProgress[`bounty_${b.date}`] = true; saveSoon();
+            return interaction.reply(`🎯 Bounty complete! +${xp} XP, +${coins} coins`);
+          }
+          break;
+        }
+
+        case 'hunt': {
+          const sub = interaction.options.getSubcommand();
+          const ch = interaction.channel;
+          if (sub==='create'){
+            const size = interaction.options.getInteger('size');
+            const exercise = interaction.options.getString('exercise');
+            if (getActiveHunt(ch.id)) return interaction.reply({ content:'⚠️ A hunt is already active here.', ephemeral:true });
+            openHunt(ch.id, size, exercise, interaction.user.id);
+            saveSoon();
+            return interaction.reply({ embeds:[huntStatusEmbed(ch)] });
+          }
+          if (sub==='join'){
+            const h = getActiveHunt(ch.id);
+            if (!h) return interaction.reply({ content:'❌ No active hunt in this channel. Use `/hunt create`.', ephemeral:true });
+            if ((user.tokens||0) <= 0) return interaction.reply({ content:'⚠️ You need 1 token to join. Log a workout to earn tokens.', ephemeral:true });
+            const { error, joined } = joinHunt(ch.id, interaction.user.id);
+            if (error) return interaction.reply({ content:`❌ ${error}`, ephemeral:true });
+            if (joined) { user.tokens -= 1; saveSoon(); }
+            return interaction.reply({ embeds:[huntStatusEmbed(ch)] });
+          }
+          if (sub==='status') return interaction.reply({ embeds:[huntStatusEmbed(interaction.channel)] });
+          if (sub==='leave'){
+            const { error } = leaveHunt(ch.id, interaction.user.id);
+            if (error) return interaction.reply({ content:`❌ ${error}`, ephemeral:true });
+            return interaction.reply({ content:'✅ You left the hunt.' });
+          }
+          if (sub==='cancel'){
+            if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({ content:'Admin only.', ephemeral:true });
+            if (!getActiveHunt(ch.id)) return interaction.reply({ content:'No active hunt.', ephemeral:true });
+            delete store.hunts[ch.id]; saveSoon();
+            return interaction.reply('🛑 Hunt cancelled.');
+          }
+          break;
+        }
+
+        case 'raid': {
+          const sub = interaction.options.getSubcommand();
+          const ch = interaction.channel;
+          if (sub==='create'){
+            if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({ content:'Admin only.', ephemeral:true });
+            if (store.raids[ch.id]) return interaction.reply({ content:'⚠️ A raid is already active here.', ephemeral:true });
+            const exercise = interaction.options.getString('exercise');
+            const hp = interaction.options.getInteger('hp') || bossHpDefault(exercise);
+            const hours = interaction.options.getInteger('hours') || 24;
+            const name = interaction.options.getString('name') || bossNameForExercise(exercise);
+            store.raids[ch.id] = {
+              theme: EXERCISE_THEMES[exercise].label,
+              exercise,
+              unit: EXERCISE_THEMES[exercise].unit,
+              bossName: name,
+              hp: hp, hpMax: hp,
+              deadline: Date.now() + hours*3600*1000,
+              startedBy: interaction.user.id,
+              participants: {},
+              done:false,
+              messageId:null
+            };
+            saveSoon();
+            await interaction.reply({ content:'🛡️ Raid started! Posting status…' });
+            await postOrUpdateRaidMessage(ch);
+            return;
+          }
+          if (sub==='status') {
+            await postOrUpdateRaidMessage(ch);
+            return interaction.reply({ content:'📡 Raid status updated.', ephemeral:true });
+          }
+          if (sub==='cancel'){
+            if(!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({ content:'Admin only.', ephemeral:true });
+            if (!store.raids[ch.id]) return interaction.reply({ content:'No active raid.', ephemeral:true });
+            delete store.raids[ch.id]; saveSoon();
+            return interaction.reply('🛑 Raid cancelled.');
+          }
+          break;
+        }
+
+        case 'adventure': {
+          return doAdventure(interaction);
+        }
+
+        default: return;
+      }
+    }
+
+    // Shop pagination buttons
+    if (interaction.isButton() && interaction.customId.startsWith('shop:')) {
+      const parts = interaction.customId.split(':'); // ['shop','prev|next', currentPage]
+      const dir = parts[1];
+      const cur = parseInt(parts[2]||'1',10);
+      const newPage = dir==='prev' ? Math.max(1, cur-1) : cur+1;
+
+      const { emb, page, totalPages } = shopEmbed(newPage);
+      const prev = new ButtonBuilder().setCustomId(`shop:prev:${page}`).setLabel('Prev').setStyle(ButtonStyle.Secondary).setDisabled(page<=1);
+      const next = new ButtonBuilder().setCustomId(`shop:next:${page}`).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(page>=totalPages);
+      const row = new ActionRowBuilder().addComponents(prev, next);
+      return interaction.update({ embeds:[emb], components:[row] });
+    }
+  } catch (err){
+    console.error('INTERACTION_ERROR', err);
+    if (interaction.isRepliable()) {
+      try { await interaction.reply({ content:'⚠️ Something went wrong.', ephemeral:true }); } catch {}
+    }
   }
 });
 
@@ -1225,6 +1219,8 @@ client.once('ready', async () => {
   console.log('✅ Global state loaded');
   await registerCommands().catch(console.error);
 });
+process.on('unhandledRejection', (e)=>{ console.error('UNHANDLED_REJECTION', e); });
+process.on('uncaughtException', (e)=>{ console.error('UNCAUGHT_EXCEPTION', e); });
 process.on('SIGTERM', ()=>{ saveStore().then(()=>process.exit(0)); });
 process.on('SIGINT', ()=>{ saveStore().then(()=>process.exit(0)); });
 
